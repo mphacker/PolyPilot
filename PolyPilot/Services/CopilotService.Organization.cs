@@ -32,6 +32,17 @@ public partial class CopilotService
     // Per-session semaphores to prevent concurrent model switches during rapid dispatch
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _modelSwitchLocks = new();
 
+    // Per-group semaphore to prevent concurrent reflect loop invocations.
+    // Without this, a second user message while the loop is awaiting workers
+    // starts a competing loop that races over shared ReflectionCycle state,
+    // causing worker results to be silently lost.
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _reflectLoopLocks = new();
+
+    // Queued user prompts received while a reflect loop is running.
+    // Drained at the start of each loop iteration and sent to the orchestrator
+    // so the model sees them in its conversation context.
+    private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _reflectQueuedPrompts = new();
+
     #region Session Organization (groups, pinning, sorting)
 
     public async Task<string> CreateMultiAgentGroupAsync(string groupName, string orchestratorModel, string workerModel, int workerCount, MultiAgentMode mode, string? systemPrompt = null)
@@ -507,6 +518,9 @@ public partial class CopilotService
             Organization.DeletedRepoGroupRepoIds.Add(group.RepoId);
 
         Organization.Groups.RemoveAll(g => g.Id == groupId);
+        // Clean up per-group caches to prevent memory leaks
+        _reflectLoopLocks.TryRemove(groupId, out _);
+        _reflectQueuedPrompts.TryRemove(groupId, out _);
         SaveOrganization();
         FlushSaveOrganization();
         OnStateChanged?.Invoke();
@@ -977,11 +991,23 @@ public partial class CopilotService
             .ToList();
         if (assignments.Count == 0)
         {
-            // Orchestrator handled it without delegation — add a system note
-            Debug($"[DISPATCH] No assignments parsed from response (length={planResponse.Length}). Workers: {string.Join(", ", workerNames)}");
-            AddOrchestratorSystemMessage(orchestratorName, "ℹ️ Orchestrator handled the request directly (no tasks delegated to workers).");
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Complete, null));
-            return;
+            // Send a nudge prompt to force delegation before giving up
+            Debug($"[DISPATCH] No assignments parsed (length={planResponse.Length}). Sending delegation nudge. Workers: {string.Join(", ", workerNames)}");
+            var nudgePrompt = BuildDelegationNudgePrompt(workerNames);
+            var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, cancellationToken, originalPrompt: prompt);
+            rawAssignments = ParseTaskAssignments(nudgeResponse, workerNames);
+            Debug($"[DISPATCH] '{orchestratorName}' nudge parsed: {rawAssignments.Count} raw assignments. Response length={nudgeResponse.Length}");
+            assignments = rawAssignments
+                .GroupBy(a => a.WorkerName, StringComparer.OrdinalIgnoreCase)
+                .Select(g => new TaskAssignment(g.Key, string.Join("\n\n---\n\n", g.Select(a => a.Task))))
+                .ToList();
+            if (assignments.Count == 0)
+            {
+                Debug($"[DISPATCH] Nudge also produced no assignments. Workers: {string.Join(", ", workerNames)}");
+                AddOrchestratorSystemMessage(orchestratorName, "ℹ️ Orchestrator handled the request directly (no tasks delegated to workers).");
+                InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Complete, null));
+                return;
+            }
         }
 
         // Phase 3: Dispatch tasks to workers in parallel
@@ -1079,6 +1105,28 @@ public partial class CopilotService
     }
 
     internal record TaskAssignment(string WorkerName, string Task);
+
+    /// <summary>
+    /// Builds a delegation nudge prompt with explicit format example.
+    /// The multiline format is required because ParseTaskAssignments' regex
+    /// needs a newline after @worker:name to capture the task body.
+    /// </summary>
+    internal static string BuildDelegationNudgePrompt(List<string> workerNames)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Your previous response did not contain any @worker delegation blocks. You MUST delegate work to your workers.");
+        sb.AppendLine();
+        sb.AppendLine($"Available workers ({workerNames.Count}): {string.Join(", ", workerNames)}");
+        sb.AppendLine();
+        sb.AppendLine("Use this EXACT format (task must be on its own line AFTER the @worker line):");
+        sb.AppendLine();
+        sb.AppendLine($"@worker:{workerNames.FirstOrDefault() ?? "worker-name"}");
+        sb.AppendLine("Describe the task here on a separate line.");
+        sb.AppendLine("@end");
+        sb.AppendLine();
+        sb.AppendLine("Do NOT do the work yourself. Output @worker blocks now.");
+        return sb.ToString();
+    }
 
     internal static List<TaskAssignment> ParseTaskAssignments(string orchestratorResponse, List<string> availableWorkers)
     {
@@ -1770,6 +1818,25 @@ public partial class CopilotService
             return;
         }
 
+        // Prevent concurrent reflect loop invocations for the same group.
+        // A second user message while workers are running would start a competing
+        // loop that races over shared reflectState, causing worker results to be lost.
+        var loopLock = _reflectLoopLocks.GetOrAdd(groupId, _ => new SemaphoreSlim(1, 1));
+        if (!loopLock.Wait(0))
+        {
+            // Loop already running — queue the prompt so it gets sent to the orchestrator's
+            // SDK session at the start of the next iteration (not just local UI history).
+            Debug($"[DISPATCH] Reflect loop already running for group '{group.Name}' — queuing prompt for next iteration");
+            var queue = _reflectQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
+            queue.Enqueue(prompt);
+            AddOrchestratorSystemMessage(orchestratorName,
+                $"📨 New user message queued (will be sent to orchestrator at next iteration): {prompt}");
+            return;
+        }
+
+        try
+        {
+
         var workerNames = members.Where(m => m != orchestratorName).ToList();
         // Tracks workers that have successfully completed at least once across all iterations.
         // Access is sequential (single async flow, no concurrent modification).
@@ -1788,6 +1855,27 @@ public partial class CopilotService
             {
             Debug($"Reflection loop: starting iteration {reflectState.CurrentIteration}/{reflectState.MaxIterations} " +
                   $"(IsActive={reflectState.IsActive}, IsPaused={reflectState.IsPaused})");
+
+            // Drain any user prompts queued while the loop was busy (e.g., waiting for workers).
+            // These are sent to the orchestrator's SDK session so the model sees them.
+            // If the model responds with @worker blocks, merge them into this iteration's assignments.
+            var queuedAssignments = new List<TaskAssignment>();
+            if (_reflectQueuedPrompts.TryGetValue(groupId, out var promptQueue))
+            {
+                while (promptQueue.TryDequeue(out var queuedPrompt))
+                {
+                    Debug($"[DISPATCH] Draining queued prompt for '{orchestratorName}' (len={queuedPrompt.Length})");
+                    var queuedResponse = await SendPromptAndWaitAsync(orchestratorName,
+                        $"[User sent a new message while you were working]\n\n{queuedPrompt}", ct, originalPrompt: prompt);
+                    var parsed = ParseTaskAssignments(queuedResponse, workerNames);
+                    if (parsed.Count > 0)
+                    {
+                        Debug($"[DISPATCH] Queued prompt response contained {parsed.Count} @worker assignments");
+                        queuedAssignments.AddRange(parsed);
+                    }
+                }
+            }
+
             // Phase 1: Plan (first iteration) or Re-plan (subsequent)
             var iterDetail = $"Iteration {reflectState.CurrentIteration}/{reflectState.MaxIterations}";
             InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Planning, iterDetail));
@@ -1804,6 +1892,7 @@ public partial class CopilotService
 
             var planResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
             var rawAssignments = ParseTaskAssignments(planResponse, workerNames);
+            Debug($"[DISPATCH] '{orchestratorName}' reflect plan parsed: {rawAssignments.Count} raw assignments from {workerNames.Count} workers. Iteration={reflectState.CurrentIteration}, Response length={planResponse.Length}");
             var assignments = rawAssignments
                 .GroupBy(a => a.WorkerName, StringComparer.OrdinalIgnoreCase)
                 .Select(g => new TaskAssignment(g.Key, string.Join("\n\n---\n\n", g.Select(a => a.Task))))
@@ -1814,23 +1903,67 @@ public partial class CopilotService
                 if (reflectState.CurrentIteration == 1)
                 {
                     // First iteration with no assignments = orchestrator failed to delegate.
-                    // Treat as error, not goal met, so we can retry.
+                    // Send a stronger nudge prompt instead of repeating the same planning prompt.
+                    Debug($"[DISPATCH] Reflect iteration 1: no assignments, sending delegation nudge");
                     AddOrchestratorSystemMessage(orchestratorName,
                         "⚠️ No @worker assignments parsed from orchestrator response. Retrying...");
-                    reflectState.ConsecutiveErrors++;
-                    if (reflectState.ConsecutiveErrors >= 3)
+                    var nudgePrompt = BuildDelegationNudgePrompt(workerNames);
+                    var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, ct, originalPrompt: prompt);
+                    var nudgeAssignments = ParseTaskAssignments(nudgeResponse, workerNames);
+                    Debug($"[DISPATCH] '{orchestratorName}' nudge parsed: {nudgeAssignments.Count} raw assignments. Response length={nudgeResponse.Length}");
+                    if (nudgeAssignments.Count > 0)
                     {
-                        reflectState.IsStalled = true;
-                        reflectState.IsCancelled = true;
+                        assignments = nudgeAssignments
+                            .GroupBy(a => a.WorkerName, StringComparer.OrdinalIgnoreCase)
+                            .Select(g => new TaskAssignment(g.Key, string.Join("\n\n---\n\n", g.Select(a => a.Task))))
+                            .ToList();
+                        // Fall through to dispatch below
+                    }
+                    else
+                    {
+                        reflectState.ConsecutiveErrors++;
+                        if (reflectState.ConsecutiveErrors >= 3)
+                        {
+                            reflectState.IsStalled = true;
+                            reflectState.IsCancelled = true;
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                else
+                {
+                    // Later iterations: orchestrator decided no more work needed —
+                    // but only declare GoalMet if no queued prompts produced @worker blocks
+                    if (queuedAssignments.Count == 0)
+                    {
+                        reflectState.GoalMet = true;
+                        AddOrchestratorSystemMessage(orchestratorName, $"✅ Orchestrator completed without delegation (iteration {reflectState.CurrentIteration}).");
                         break;
                     }
-                    continue;
+                    // Fall through to merge and dispatch queued work
                 }
-                // Later iterations: orchestrator decided no more work needed
-                reflectState.GoalMet = true;
-                AddOrchestratorSystemMessage(orchestratorName, $"✅ Orchestrator completed without delegation (iteration {reflectState.CurrentIteration}).");
-                break;
             }
+
+            // Merge any @worker assignments from queued prompt responses
+            if (queuedAssignments.Count > 0)
+            {
+                var extra = queuedAssignments
+                    .GroupBy(a => a.WorkerName, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => new TaskAssignment(g.Key, string.Join("\n\n---\n\n", g.Select(a => a.Task))))
+                    .ToList();
+                foreach (var a in extra)
+                {
+                    var existing = assignments.FirstOrDefault(x => string.Equals(x.WorkerName, a.WorkerName, StringComparison.OrdinalIgnoreCase));
+                    if (existing != null)
+                        assignments[assignments.IndexOf(existing)] = new TaskAssignment(existing.WorkerName, existing.Task + "\n\n---\n\n" + a.Task);
+                    else
+                        assignments.Add(a);
+                }
+            }
+
+            if (assignments.Count == 0)
+                continue;
 
             // Phase 2-3: Dispatch + Collect
             InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Dispatching,
@@ -2028,12 +2161,37 @@ public partial class CopilotService
             reflectState.IsActive = false;
             reflectState.CompletedAt = DateTime.Now;
             ClearPendingOrchestration();
+            // Send any remaining queued prompts to the orchestrator before releasing the lock.
+            // These were acknowledged to the user ("📨 queued") but the loop is exiting —
+            // sending them ensures the model sees them rather than silently discarding.
+            if (_reflectQueuedPrompts.TryGetValue(groupId, out var remainingQueue))
+            {
+                while (remainingQueue.TryDequeue(out var leftover))
+                {
+                    try
+                    {
+                        Debug($"[DISPATCH] Sending leftover queued prompt on loop exit (len={leftover.Length})");
+                        await SendPromptAndWaitAsync(orchestratorName,
+                            $"[User sent a message — the reflection loop has completed]\n\n{leftover}", ct, originalPrompt: prompt);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug($"[DISPATCH] Failed to send leftover queued prompt: {ex.Message}");
+                    }
+                }
+            }
             SaveOrganization();
             InvokeOnUI(() =>
             {
                 OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Complete, reflectState.BuildCompletionSummary());
                 OnStateChanged?.Invoke();
             });
+        }
+
+        } // end loopLock guard
+        finally
+        {
+            loopLock.Release();
         }
     }
 
