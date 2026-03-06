@@ -467,7 +467,7 @@
             @if (discoveredPlugins.Count == 0)
             {
                 <p class="section-desc" style="color: var(--text-tertiary);">
-                    No plugins found. Place plugin DLLs in <code>~/.polypilot/plugins/</code> to discover them.
+                    No plugins found. Place plugin folders in <code>~/.polypilot/plugins/</code> — each folder should contain a <code>plugin.json</code> manifest.
                 </p>
             }
             else
@@ -481,10 +481,18 @@
                     <div class="plugin-card" style="border-left: 3px solid @(enabled != null && !hashChanged ? "var(--accent-success)" : hashChanged ? "var(--accent-warning, orange)" : "var(--border-primary)");">
                         <div class="plugin-header">
                             <span class="plugin-status">@(enabled != null && !hashChanged ? "✅" : hashChanged ? "⚠️" : "🆕")</span>
-                            <strong>@plugin.FileName</strong>
+                            <strong>@plugin.Name</strong>
+                            @if (!string.IsNullOrEmpty(plugin.Version))
+                            {
+                                <span style="font-size:0.8em; color:var(--text-secondary); margin-left:6px;">v@plugin.Version</span>
+                            }
                         </div>
+                        @if (!string.IsNullOrEmpty(plugin.Description))
+                        {
+                            <div style="font-size:0.9em; margin:4px 0;">@plugin.Description</div>
+                        }
                         <div class="plugin-details" style="font-size:0.85em; color:var(--text-secondary); margin:4px 0;">
-                            <div>📁 @plugin.DirectoryName</div>
+                            <div>📦 @plugin.DirectoryName / @plugin.FileName</div>
                             <div>🔒 SHA-256: @plugin.Hash[..Math.Min(16, plugin.Hash.Length)]…</div>
                             @if (enabled != null && !hashChanged)
                             {
@@ -1352,7 +1360,7 @@
             Path = plugin.Path,
             Hash = plugin.Hash,
             EnabledAt = DateTime.UtcNow,
-            DisplayName = plugin.FileName
+            DisplayName = plugin.Name
         });
 
         settings.Save();

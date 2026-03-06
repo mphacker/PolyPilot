@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Runtime.Loader;
 using System.Security.Cryptography;
+using System.Text.Json;
 using PolyPilot.Models;
 using PolyPilot.Provider;
 using Microsoft.Extensions.DependencyInjection;
@@ -9,8 +10,10 @@ namespace PolyPilot.Services;
 
 /// <summary>
 /// Discovers and loads provider plugins from ~/.polypilot/plugins/.
+/// Each plugin lives in its own subdirectory with a plugin.json manifest
+/// that declares the entry-point DLL, display name, description, and version.
 /// Plugins are never auto-loaded — the user must explicitly approve each one in Settings → Plugins.
-/// A SHA-256 hash check prevents silent DLL replacement.
+/// A SHA-256 hash check on the entry-point DLL prevents silent replacement.
 /// </summary>
 public static class PluginLoader
 {
@@ -19,7 +22,8 @@ public static class PluginLoader
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".polypilot", "plugins");
 
     /// <summary>
-    /// Scans the plugins directory for DLLs. Returns metadata only — no assemblies are loaded.
+    /// Scans the plugins directory for subdirectories containing a plugin.json manifest.
+    /// Returns metadata only — no assemblies are loaded.
     /// </summary>
     public static List<DiscoveredPlugin> DiscoverPlugins()
     {
@@ -27,27 +31,46 @@ public static class PluginLoader
         if (!Directory.Exists(PluginsDir))
             return plugins;
 
-        foreach (var dll in Directory.EnumerateFiles(PluginsDir, "*.dll", SearchOption.AllDirectories))
+        foreach (var dir in Directory.GetDirectories(PluginsDir))
         {
+            var manifestPath = Path.Combine(dir, "plugin.json");
+            if (!File.Exists(manifestPath))
+                continue;
+
             try
             {
-                var relativePath = Path.GetRelativePath(PluginsDir, dll);
-                var fileInfo = new FileInfo(dll);
-                var hash = ComputeHash(dll);
+                var json = File.ReadAllText(manifestPath);
+                var manifest = JsonSerializer.Deserialize<PluginManifest>(json,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                if (manifest == null || string.IsNullOrWhiteSpace(manifest.EntryPoint))
+                    continue;
+
+                var entryDll = Path.Combine(dir, manifest.EntryPoint);
+                if (!File.Exists(entryDll))
+                    continue;
+
+                var dirName = Path.GetFileName(dir);
+                var hash = ComputeHash(entryDll);
 
                 plugins.Add(new DiscoveredPlugin
                 {
-                    Path = relativePath,
-                    FullPath = dll,
+                    // Path is the subdirectory name — the unit of identity
+                    Path = dirName,
+                    FullPath = entryDll,
                     Hash = hash,
-                    FileName = Path.GetFileName(dll),
-                    DirectoryName = Path.GetDirectoryName(relativePath) ?? "",
-                    SizeBytes = fileInfo.Length
+                    FileName = manifest.EntryPoint,
+                    DirectoryName = dirName,
+                    SizeBytes = new FileInfo(entryDll).Length,
+                    // Manifest metadata for UI display
+                    Name = manifest.Name ?? dirName,
+                    Description = manifest.Description ?? "",
+                    Version = manifest.Version ?? "",
                 });
             }
             catch
             {
-                // Skip files we can't read
+                // Skip malformed manifests
             }
         }
 
@@ -64,7 +87,40 @@ public static class PluginLoader
 
         foreach (var plugin in enabledPlugins)
         {
-            var fullPath = Path.Combine(PluginsDir, plugin.Path);
+            // Resolve the entry-point DLL from the plugin subdirectory
+            var pluginDir = Path.Combine(PluginsDir, plugin.Path);
+            string fullPath;
+
+            if (Directory.Exists(pluginDir))
+            {
+                // Manifest-based: read entry point from plugin.json
+                var manifestPath = Path.Combine(pluginDir, "plugin.json");
+                if (File.Exists(manifestPath))
+                {
+                    try
+                    {
+                        var json = File.ReadAllText(manifestPath);
+                        var manifest = JsonSerializer.Deserialize<PluginManifest>(json,
+                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        fullPath = Path.Combine(pluginDir, manifest?.EntryPoint ?? "");
+                    }
+                    catch
+                    {
+                        warnings.Add($"Plugin '{plugin.DisplayName}' has invalid manifest");
+                        continue;
+                    }
+                }
+                else
+                {
+                    warnings.Add($"Plugin '{plugin.DisplayName}' missing plugin.json manifest");
+                    continue;
+                }
+            }
+            else
+            {
+                // Legacy: Path might be a direct DLL path (backward compat)
+                fullPath = Path.Combine(PluginsDir, plugin.Path);
+            }
 
             if (!File.Exists(fullPath))
             {
@@ -83,14 +139,14 @@ public static class PluginLoader
             {
                 var loadContext = new PluginLoadContext(fullPath);
                 var assembly = loadContext.LoadFromAssemblyPath(fullPath);
-                var pluginDir = Path.GetDirectoryName(fullPath) ?? PluginsDir;
+                var assemblyDir = Path.GetDirectoryName(fullPath) ?? PluginsDir;
 
                 foreach (var type in assembly.GetExportedTypes()
                     .Where(t => typeof(ISessionProviderFactory).IsAssignableFrom(t) && !t.IsAbstract))
                 {
                     if (Activator.CreateInstance(type) is ISessionProviderFactory factory)
                     {
-                        factory.ConfigureServices(services, pluginDir);
+                        factory.ConfigureServices(services, assemblyDir);
                     }
                 }
             }
@@ -151,7 +207,22 @@ public static class PluginLoader
 }
 
 /// <summary>
-/// Metadata about a discovered plugin DLL. No code is loaded at this stage.
+/// The plugin.json manifest file that lives in each plugin subdirectory.
+/// </summary>
+public class PluginManifest
+{
+    /// <summary>The DLL filename containing the ISessionProviderFactory (e.g., "Papilot.PolyPilot.dll").</summary>
+    public string EntryPoint { get; set; } = "";
+    /// <summary>Human-readable plugin name shown in Settings.</summary>
+    public string? Name { get; set; }
+    /// <summary>Short description shown in Settings.</summary>
+    public string? Description { get; set; }
+    /// <summary>Plugin version (e.g., "0.1.0").</summary>
+    public string? Version { get; set; }
+}
+
+/// <summary>
+/// Metadata about a discovered plugin. No code is loaded at this stage.
 /// </summary>
 public class DiscoveredPlugin
 {
@@ -161,4 +232,10 @@ public class DiscoveredPlugin
     public string FileName { get; init; } = "";
     public string DirectoryName { get; init; } = "";
     public long SizeBytes { get; init; }
+    /// <summary>Display name from plugin.json manifest.</summary>
+    public string Name { get; init; } = "";
+    /// <summary>Description from plugin.json manifest.</summary>
+    public string Description { get; init; } = "";
+    /// <summary>Version from plugin.json manifest.</summary>
+    public string Version { get; init; } = "";
 }
