@@ -8,6 +8,7 @@
 @{
     var isPinned = Meta?.IsPinned ?? false;
     var sessionDir = GetSessionDirectory();
+    var provider = CopilotService.GetProviderForSession(Session.Name);
     var cssClass = IsActive ? "active" : 
                    IsCompleted ? "completed" :
                    Session.IsProcessing ? "busy" : "";
@@ -20,8 +21,9 @@
         : 0;
     var contextColor = contextPct > 85 ? "var(--accent-primary)" : contextPct > 60 ? "#fbbf24" : "var(--accent-success)";
 }
-<div class="session-item @cssClass @(isPinned ? "pinned" : "")"
+<div class="session-item @cssClass @(isPinned ? "pinned" : "") @(provider != null ? "provider-session" : "")"
      data-session-name="@Session.Name"
+     style="@(provider != null ? $"border-left: 3px solid {provider.AccentColor};" : "")"
      @onclick="() => OnSelect.InvokeAsync()"
      @oncontextmenu="OpenContextMenu"
      @oncontextmenu:preventDefault="true">
@@ -50,6 +52,10 @@
             }
             else
             {
+                @if (provider != null)
+                {
+                    <span class="provider-icon" title="@provider.DisplayName">@provider.Icon</span>
+                }
                 <span class="session-name-text" @ondblclick="() => OnStartRename.InvokeAsync()" @ondblclick:stopPropagation="true">@Session.Name</span>
                 @if (Meta?.Role == MultiAgentRole.Orchestrator)
                 {
@@ -58,6 +64,10 @@
                 @if (Session.UnreadCount > 0)
                 {
                     <span class="unread-badge">@Session.UnreadCount</span>
+                }
+                @if (provider != null && Session.IsProcessing)
+                {
+                    <span class="processing-indicator" style="color: @provider.AccentColor;">●</span>
                 }
             }
         </span>

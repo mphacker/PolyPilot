@@ -1,0 +1,72 @@
+/* Generic provider session styles — no provider-specific values.
+   All accent colors come from inline style attributes set by provider properties. */
+
+.provider-session {
+    transition: border-color 0.2s, background-color 0.2s;
+}
+
+.provider-session:hover {
+    background-color: rgba(128, 128, 128, 0.1);
+}
+
+.provider-icon {
+    font-size: 1.2em;
+    margin-right: 6px;
+}
+
+.provider-group {
+    border-left: 3px solid transparent;
+    padding: 8px 0;
+    margin-bottom: 8px;
+}
+
+.provider-action-btn {
+    background: transparent;
+    border: 1px solid rgba(128, 128, 128, 0.3);
+    border-radius: 4px;
+    padding: 4px 8px;
+    cursor: pointer;
+    font-size: 0.85em;
+    margin: 2px;
+    transition: background-color 0.2s;
+}
+
+.provider-action-btn:hover {
+    background-color: rgba(128, 128, 128, 0.15);
+}
+
+.processing-indicator {
+    animation: provider-pulse 1.5s infinite;
+    margin-left: 4px;
+}
+
+@keyframes provider-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+/* Plugin settings card */
+.plugin-card {
+    background: var(--bg-secondary, #1a1a2e);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+}
+
+.plugin-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.plugin-status {
+    font-size: 1em;
+}
+
+.plugin-details {
+    padding-left: 26px;
+}
+
+.plugin-actions {
+    padding-left: 26px;
+}

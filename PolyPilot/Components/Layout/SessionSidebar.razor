@@ -406,6 +406,7 @@ else
 
                 @foreach (var (group, groupSessions) in organized)
                 {
+                    var groupProvider = CopilotService.GetProviderForGroup(group.Id);
                     @if (showGroupHeaders)
                     {
                         var isRepoGroup = !string.IsNullOrEmpty(group.RepoId);
@@ -414,11 +415,18 @@ else
                         var repoDiskSize = repoForGroup != null ? RepoManager.GetRepoDiskSize(repoForGroup.Id) : null;
                         if (repoDiskSize.HasValue)
                             groupTitle += $"\nDisk: {RepoManager.FormatSize(repoDiskSize.Value)}";
-                        <div class="group-header @(group.IsCollapsed ? "collapsed" : "") @(isRepoGroup ? "repo-group" : "")"
+                        if (groupProvider != null)
+                            groupTitle = groupProvider.GroupDescription;
+                        <div class="group-header @(group.IsCollapsed ? "collapsed" : "") @(isRepoGroup ? "repo-group" : "") @(groupProvider != null ? "provider-group" : "")"
                              title="@groupTitle"
+                             style="@(groupProvider != null ? $"border-left-color: {groupProvider.AccentColor};" : "")"
                              @onclick="() => CopilotService.ToggleGroupCollapsed(group.Id)">
                             <span class="group-chevron">@(group.IsCollapsed ? "▶" : "▼")</span>
-                            @if (isRepoGroup)
+                            @if (groupProvider != null)
+                            {
+                                <span class="group-repo-icon" title="@groupProvider.DisplayName">@groupProvider.Icon</span>
+                            }
+                            else if (isRepoGroup)
                             {
                                 <span class="group-repo-icon" title="Repository">⌥</span>
                             }
@@ -650,6 +658,26 @@ else
 
                     @if (!group.IsCollapsed || !showGroupHeaders)
                     {
+                        @if (groupProvider != null)
+                        {
+                            var providerActions = groupProvider.GetActions();
+                            @if (providerActions.Count > 0)
+                            {
+                                <div class="provider-actions-bar" style="padding: 4px 8px;">
+                                    @foreach (var action in providerActions)
+                                    {
+                                        var actionProvider = groupProvider;
+                                        var actionId = action.Id;
+                                        <button class="provider-action-btn"
+                                                title="@action.Tooltip"
+                                                @onclick="() => ExecuteProviderAction(actionProvider, actionId)"
+                                                @onclick:stopPropagation="true">
+                                            @action.Label
+                                        </button>
+                                    }
+                                </div>
+                            }
+                        }
                         @foreach (var session in groupSessions)
                         {
                             sessionIndex++;
@@ -2171,6 +2199,18 @@ Important conventions:
 
     private static string EscapeForShell(string s) =>
         s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("`", "\\`").Replace("$", "\\$");
+
+    private async Task ExecuteProviderAction(PolyPilot.Provider.ISessionProvider provider, string actionId)
+    {
+        try
+        {
+            await provider.ExecuteActionAsync(actionId);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SessionSidebar] Provider action '{actionId}' failed: {ex.Message}");
+        }
+    }
 
     public void Dispose()
     {

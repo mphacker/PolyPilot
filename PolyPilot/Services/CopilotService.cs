@@ -514,6 +514,9 @@ public partial class CopilotService : IAsyncDisposable
 
         // Resume any pending orchestration dispatch that was interrupted by a relaunch
         _ = ResumeOrchestrationIfPendingAsync(cancellationToken);
+
+        // Initialize any registered providers (from DI / plugin loader)
+        await InitializeProvidersAsync(cancellationToken);
     }
 
     /// <summary>
@@ -652,6 +655,9 @@ public partial class CopilotService : IAsyncDisposable
 
         // Resume any pending orchestration dispatch
         _ = ResumeOrchestrationIfPendingAsync(cancellationToken);
+
+        // Re-initialize providers after reconnect
+        await InitializeProvidersAsync(cancellationToken);
     }
 
     private CopilotClient CreateClient(ConnectionSettings settings)
@@ -1948,6 +1954,10 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
     public async Task<string> SendPromptAsync(string sessionName, string prompt, List<string>? imagePaths = null, CancellationToken cancellationToken = default, bool skipHistoryMessage = false, string? agentMode = null, string? originalPrompt = null)
     {
+        // Provider sessions route through their own messaging
+        if (IsProviderSession(sessionName))
+            return await SendToProviderAsync(sessionName, prompt, cancellationToken) ?? "";
+
         // Normalize smart punctuation (macOS/WebKit converts -- to em dash, etc.)
         prompt = SmartPunctuationNormalizer.Normalize(prompt);
 
@@ -2241,6 +2251,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
     public async Task AbortSessionAsync(string sessionName, bool markAsInterrupted = false)
     {
+        // Provider sessions manage their own cancellation
+        if (IsProviderSession(sessionName)) return;
+
         // In remote mode, delegate to bridge server
         if (IsRemoteMode)
         {
@@ -2739,6 +2752,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
     internal async Task<bool> CloseSessionCoreAsync(string name, bool notifyUi)
     {
+        // Provider sessions manage their own lifecycle
+        if (IsProviderSession(name)) return false;
+
         // Clean up any active reflection cycle (including evaluator session)
         StopReflectionCycle(name);
 
@@ -2856,6 +2872,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 try { await state.Session.DisposeAsync(); } catch { }
         }
         _sessions.Clear();
+
+        // Shut down all registered providers
+        await ShutdownProvidersAsync();
 
         if (_client != null)
         {
