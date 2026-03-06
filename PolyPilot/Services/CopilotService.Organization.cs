@@ -444,9 +444,11 @@ public partial class CopilotService
     {
         if (groupId == SessionGroup.DefaultId) return;
 
+        // Provider groups are managed by their plugin — can't be deleted while plugin is loaded
+        if (GetProviderForGroup(groupId) != null) return;
+
         var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
         var isMultiAgent = group?.IsMultiAgent ?? false;
-        var isProviderGroup = GetProviderForGroup(groupId) != null;
 
         // Collect all worktree IDs for cleanup before removing metadata
         var worktreeIds = new HashSet<string>();
@@ -457,7 +459,7 @@ public partial class CopilotService
         foreach (var m in Organization.Sessions.Where(m => m.GroupId == groupId))
             if (m.WorktreeId != null) worktreeIds.Add(m.WorktreeId);
 
-        if (isMultiAgent || isProviderGroup)
+        if (isMultiAgent)
         {
             // Multi-agent sessions are meaningless without their group — close them
             var sessionNames = Organization.Sessions
@@ -523,19 +525,6 @@ public partial class CopilotService
         // but are tracked separately, so deleting a squad must not suppress the regular sidebar group.
         if (group?.RepoId != null && !isMultiAgent)
             Organization.DeletedRepoGroupRepoIds.Add(group.RepoId);
-
-        // Clean up provider registrations so sessions aren't re-created on next reconcile
-        if (isProviderGroup)
-        {
-            var provider = GetProviderForGroup(groupId);
-            if (provider != null)
-            {
-                _providers.Remove(provider.ProviderId);
-                foreach (var key in _sessionToProviderId.Where(kv => kv.Value == provider.ProviderId).Select(kv => kv.Key).ToList())
-                    _sessionToProviderId.Remove(key);
-                _providerSelectedMode.Remove(groupId);
-            }
-        }
 
         Organization.Groups.RemoveAll(g => g.Id == groupId);
         // Clean up per-group caches to prevent memory leaks
