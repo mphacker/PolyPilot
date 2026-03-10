@@ -53,6 +53,9 @@ public partial class CopilotService : IAsyncDisposable
     private ConnectionSettings? _currentSettings;
     private string? _activeSessionName;
     private SynchronizationContext? _syncContext;
+    // Serializes the IsConnectionError reconnect path so concurrent workers
+    // don't destroy each other's freshly-created client (thundering herd fix).
+    private readonly SemaphoreSlim _clientReconnectLock = new(1, 1);
     
     private static readonly object _pathLock = new();
     private static string? _copilotBaseDir;
@@ -2493,47 +2496,68 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     if (client == null)
                         throw new InvalidOperationException("Client is not initialized");
 
-                    // If the underlying connection is broken, recreate the client first
+                    // If the underlying connection is broken, recreate the client first.
+                    // Serialize via _clientReconnectLock so concurrent workers don't each
+                    // dispose+recreate _client (thundering herd — only the first one reconnects).
                     if (IsConnectionError(ex))
                     {
-                        Debug("Connection error detected, recreating client before session reconnect...");
-                        var connSettings = _currentSettings ?? ConnectionSettings.Load();
-                        if (CurrentMode == ConnectionMode.Persistent &&
-                            !_serverManager.CheckServerRunning("127.0.0.1", connSettings.Port))
-                        {
-                            Debug("Persistent server not running, restarting...");
-                            var started = await _serverManager.StartServerAsync(connSettings.Port);
-                            if (!started)
-                            {
-                                Debug("Failed to restart persistent server");
-                                try { await _client.DisposeAsync(); } catch { }
-                                _client = null;
-                                IsInitialized = false;
-                                throw;
-                            }
-                        }
-                        try { await _client.DisposeAsync(); } catch { }
+                        Debug($"Connection error detected for '{sessionName}', acquiring reconnect lock...");
+                        await _clientReconnectLock.WaitAsync(cancellationToken);
                         try
                         {
-                            _client = CreateClient(connSettings);
-                            await _client.StartAsync(cancellationToken);
-                            client = _client; // Update local reference to the new client
-                            Debug("Client recreated successfully");
+                            // Double-check: another worker may have already reconnected while we waited.
+                            // Compare references — if _client changed, someone else already recreated it.
+                            if (!ReferenceEquals(_client, client))
+                            {
+                                Debug($"Client already reconnected by another worker, skipping recreate for '{sessionName}'");
+                                client = _client;
+                            }
+                            else
+                            {
+                                Debug("Recreating client after connection error...");
+                                var connSettings = _currentSettings ?? ConnectionSettings.Load();
+                                if (CurrentMode == ConnectionMode.Persistent &&
+                                    !_serverManager.CheckServerRunning("127.0.0.1", connSettings.Port))
+                                {
+                                    Debug("Persistent server not running, restarting...");
+                                    var started = await _serverManager.StartServerAsync(connSettings.Port);
+                                    if (!started)
+                                    {
+                                        Debug("Failed to restart persistent server");
+                                        try { await _client.DisposeAsync(); } catch { }
+                                        _client = null;
+                                        IsInitialized = false;
+                                        throw;
+                                    }
+                                }
+                                try { await _client.DisposeAsync(); } catch { }
+                                try
+                                {
+                                    _client = CreateClient(connSettings);
+                                    await _client.StartAsync(cancellationToken);
+                                    client = _client;
+                                    Debug("Client recreated successfully");
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                    try { if (_client != null) await _client.DisposeAsync(); } catch { }
+                                    _client = null;
+                                    IsInitialized = false;
+                                    throw;
+                                }
+                                catch (Exception clientEx)
+                                {
+                                    Debug($"Failed to recreate client: {clientEx.Message}");
+                                    try { if (_client != null) await _client.DisposeAsync(); } catch { }
+                                    _client = null;
+                                    IsInitialized = false;
+                                    throw;
+                                }
+                            }
                         }
-                        catch (OperationCanceledException)
+                        finally
                         {
-                            try { if (_client != null) await _client.DisposeAsync(); } catch { }
-                            _client = null;
-                            IsInitialized = false;
-                            throw;
-                        }
-                        catch (Exception clientEx)
-                        {
-                            Debug($"Failed to recreate client: {clientEx.Message}");
-                            try { if (_client != null) await _client.DisposeAsync(); } catch { }
-                            _client = null;
-                            IsInitialized = false;
-                            throw;
+                            _clientReconnectLock.Release();
                         }
                     }
 
@@ -2557,46 +2581,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                         // with full config (MCP servers, skills, system message) matching CreateSessionAsync.
                         Debug($"Session '{sessionName}' expired on server, creating fresh session...");
                         OnActivity?.Invoke(sessionName, "🔄 Session expired, creating new session...");
-                        var freshSettings = _currentSettings ?? ConnectionSettings.Load();
-                        var freshMcpServers = LoadMcpServers(freshSettings.DisabledMcpServers, freshSettings.DisabledPlugins);
-                        var freshSkillDirs = LoadSkillDirectories(freshSettings.DisabledPlugins);
-                        // Rebuild system message with the same conditional logic as CreateSessionAsync
-                        var freshSystemContent = new StringBuilder();
-                        var freshDir = state.Info.WorkingDirectory;
-                        if (string.Equals(freshDir, ProjectDir, StringComparison.OrdinalIgnoreCase))
-                        {
-                            var relaunchCmd = OperatingSystem.IsWindows()
-                                ? $"powershell -ExecutionPolicy Bypass -File \"{Path.Combine(ProjectDir, "relaunch.ps1")}\""
-                                : $"bash {Path.Combine(ProjectDir, "relaunch.sh")}";
-                            freshSystemContent.AppendLine($@"
-CRITICAL BUILD INSTRUCTION: You are running inside the PolyPilot MAUI application.
-When you make ANY code changes to files in {ProjectDir}, you MUST rebuild and relaunch by running:
-
-    {relaunchCmd}
-
-This script builds the app, launches a new instance, waits for it to start, then kills the old one.
-NEVER use 'dotnet build' + 'open' separately. NEVER skip the relaunch after code changes.
-ALWAYS run the relaunch script as the final step after making changes to this project.
-");
-                        }
-                        var freshConfig = new SessionConfig
-                        {
-                            Model = reconnectModel ?? DefaultModel,
-                            WorkingDirectory = freshDir,
-                            McpServers = freshMcpServers,
-                            SkillDirectories = freshSkillDirs,
-                            Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
-                            SystemMessage = new SystemMessageConfig
-                            {
-                                Mode = SystemMessageMode.Append,
-                                Content = freshSystemContent.ToString()
-                            },
-                            OnPermissionRequest = AutoApprovePermissions
-                        };
-                        if (freshMcpServers != null)
-                            Debug($"[RECONNECT] Fresh session config includes {freshMcpServers.Count} MCP server(s)");
-                        if (freshSkillDirs != null)
-                            Debug($"[RECONNECT] Fresh session config includes {freshSkillDirs.Count} skill dir(s)");
+                        var freshConfig = BuildFreshSessionConfig(state);
                         newSession = await client.CreateSessionAsync(freshConfig, cancellationToken);
                         state.Info.SessionId = newSession.SessionId;
                     }
@@ -2633,6 +2618,10 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     state.PendingReasoningMessages.Clear();
                     Debug($"[RECONNECT] '{sessionName}' reset processing state: gen={Interlocked.Read(ref state.ProcessingGeneration)}");
                     
+                    // Reset HasUsedToolsThisTurn so the retried turn starts with the default
+                    // 120s watchdog tier instead of the inflated 600s from stale tool state.
+                    Volatile.Write(ref state.HasUsedToolsThisTurn, false);
+
                     // Start fresh watchdog for the new connection
                     StartProcessingWatchdog(state, sessionName);
                     
@@ -2706,6 +2695,56 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Interlocked.Exchange(ref state.SendingFlag, 0);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Build a fresh SessionConfig with MCP servers, skill directories, and system message.
+    /// Mirrors the reconnect handler's "Session not found" path to ensure revived/fresh sessions
+    /// have full external tool access.
+    /// </summary>
+    private SessionConfig BuildFreshSessionConfig(SessionState state, List<Microsoft.Extensions.AI.AIFunction>? tools = null)
+    {
+        var settings = _currentSettings ?? ConnectionSettings.Load();
+        var mcpServers = LoadMcpServers(settings.DisabledMcpServers, settings.DisabledPlugins);
+        var skillDirs = LoadSkillDirectories(settings.DisabledPlugins);
+        var systemContent = new StringBuilder();
+        var workDir = state.Info.WorkingDirectory;
+        if (string.Equals(workDir, ProjectDir, StringComparison.OrdinalIgnoreCase))
+        {
+            var relaunchCmd = OperatingSystem.IsWindows()
+                ? $"powershell -ExecutionPolicy Bypass -File \"{Path.Combine(ProjectDir, "relaunch.ps1")}\""
+                : $"bash {Path.Combine(ProjectDir, "relaunch.sh")}";
+            systemContent.AppendLine($@"
+CRITICAL BUILD INSTRUCTION: You are running inside the PolyPilot MAUI application.
+When you make ANY code changes to files in {ProjectDir}, you MUST rebuild and relaunch by running:
+
+    {relaunchCmd}
+
+This script builds the app, launches a new instance, waits for it to start, then kills the old one.
+NEVER use 'dotnet build' + 'open' separately. NEVER skip the relaunch after code changes.
+ALWAYS run the relaunch script as the final step after making changes to this project.
+");
+        }
+        var finalTools = tools ?? new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() };
+        var config = new SessionConfig
+        {
+            Model = Models.ModelHelper.NormalizeToSlug(state.Info.Model) ?? DefaultModel,
+            WorkingDirectory = workDir,
+            McpServers = mcpServers,
+            SkillDirectories = skillDirs,
+            Tools = finalTools,
+            SystemMessage = new SystemMessageConfig
+            {
+                Mode = SystemMessageMode.Append,
+                Content = systemContent.ToString()
+            },
+            OnPermissionRequest = AutoApprovePermissions
+        };
+        if (mcpServers != null)
+            Debug($"[FRESH-CONFIG] Includes {mcpServers.Count} MCP server(s)");
+        if (skillDirs != null)
+            Debug($"[FRESH-CONFIG] Includes {skillDirs.Count} skill dir(s)");
+        return config;
     }
 
     public async Task AbortSessionAsync(string sessionName, bool markAsInterrupted = false)
