@@ -233,6 +233,12 @@ public partial class CopilotService : IAsyncDisposable
     public string? FallbackNotice { get; private set; }
     public void ClearFallbackNotice() => FallbackNotice = null;
 
+    // Server health notice — shown when the headless server's native modules are broken
+    // (e.g., posix_spawn failures due to cleaned-up pkg directory)
+    public string? ServerHealthNotice { get; private set; }
+    public void ClearServerHealthNotice() => ServerHealthNotice = null;
+    public void SetServerHealthNotice(string notice) => ServerHealthNotice = notice;
+
     // GitHub user info
     public string? GitHubAvatarUrl { get; private set; }
     public string? GitHubLogin { get; private set; }
@@ -899,6 +905,7 @@ public partial class CopilotService : IAsyncDisposable
             CancelProcessingWatchdog(state);
             CancelTurnEndFallback(state);
             CancelToolHealthCheck(state);
+            DisposePrematureIdleSignal(state);
             try { if (state.Session != null) await state.Session.DisposeAsync(); } catch { }
         }
         _sessions.Clear();
@@ -1069,6 +1076,106 @@ public partial class CopilotService : IAsyncDisposable
         finally
         {
             _recoveryLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Restarts the headless server and reconnects all sessions.
+    /// Used when the server's native modules become stale (e.g., posix_spawn failures
+    /// because another CLI installation cleaned up ~/.copilot/pkg/darwin-arm64/).
+    /// Follows the version-mismatch restart pattern: stop → wait → start → recreate client → restore sessions.
+    /// </summary>
+    public async Task RestartServerAsync(CancellationToken cancellationToken = default)
+    {
+        if (CurrentMode != ConnectionMode.Persistent)
+        {
+            Debug("[SERVER-RESTART] Not in Persistent mode, using ReconnectAsync instead");
+            var settings = _currentSettings ?? ConnectionSettings.Load();
+            await ReconnectAsync(settings, cancellationToken);
+            return;
+        }
+
+        await _clientReconnectLock.WaitAsync(cancellationToken);
+        try
+        {
+            Debug("[SERVER-RESTART] Restarting headless server due to native module failure...");
+            ServerHealthNotice = null;
+
+            // 1. Dispose all existing sessions (they hold broken connections)
+            foreach (var state in _sessions.Values)
+            {
+                CancelProcessingWatchdog(state);
+                CancelTurnEndFallback(state);
+                CancelToolHealthCheck(state);
+                DisposePrematureIdleSignal(state);
+                try { if (state.Session != null) await state.Session.DisposeAsync(); } catch { }
+            }
+            _sessions.Clear();
+            _closedSessionIds.Clear();
+            _closedSessionNames.Clear();
+
+            // 2. Dispose old client
+            if (_client != null)
+            {
+                try { await _client.DisposeAsync(); } catch { }
+                _client = null;
+            }
+
+            // 3. Kill the old server process
+            _serverManager.StopServer();
+
+            // 4. Wait for port to be free
+            var restartSettings = _currentSettings ?? ConnectionSettings.Load();
+            for (int i = 0; i < 20; i++)
+            {
+                if (!_serverManager.CheckServerRunning("127.0.0.1", restartSettings.Port))
+                    break;
+                await Task.Delay(250, cancellationToken);
+            }
+
+            // 5. Start fresh server (will extract current native modules)
+            var started = await _serverManager.StartServerAsync(restartSettings.Port);
+            if (!started)
+            {
+                Debug("[SERVER-RESTART] Failed to restart server");
+                FallbackNotice = "Server restart failed — go to Settings to reconnect.";
+                IsInitialized = false;
+                OnStateChanged?.Invoke();
+                return;
+            }
+
+            // 6. Create new client and connect
+            _client = CreateClient(restartSettings);
+            try
+            {
+                await _client.StartAsync(cancellationToken);
+                IsInitialized = true;
+                NeedsConfiguration = false;
+                Debug("[SERVER-RESTART] Server restarted and client connected");
+            }
+            catch (Exception ex)
+            {
+                Debug($"[SERVER-RESTART] Failed to connect after restart: {ex.Message}");
+                try { await _client.DisposeAsync(); } catch { }
+                _client = null;
+                IsInitialized = false;
+                FallbackNotice = "Server restarted but connection failed — go to Settings to reconnect.";
+                OnStateChanged?.Invoke();
+                return;
+            }
+
+            // 7. Restore all sessions from disk
+            LoadOrganization();
+            await RestorePreviousSessionsAsync(cancellationToken);
+            FlushSaveActiveSessionsToDisk();
+            ReconcileOrganization();
+            OnStateChanged?.Invoke();
+
+            Debug("[SERVER-RESTART] Server restart complete, all sessions restored");
+        }
+        finally
+        {
+            _clientReconnectLock.Release();
         }
     }
 
@@ -1685,12 +1792,15 @@ public partial class CopilotService : IAsyncDisposable
                 throw new InvalidOperationException($"Session '{baseName}' already exists (too many duplicates).");
         }
 
-        // Load history: always parse events.jsonl as source of truth, then sync to DB
-        List<ChatMessage> history = LoadHistoryFromDisk(sessionId);
+        // Load history: compare events.jsonl and chat_history.db, prefer whichever is richer.
+        // The SDK's event file writer can break after server-side idle cleanup + re-resume
+        // ("dead event stream"), causing in-memory events to never persist to events.jsonl.
+        // ChatDatabase is written fire-and-forget on every message and survives this.
+        var (history, historyFromDb) = await LoadBestHistoryAsync(sessionId);
 
-        if (history.Count > 0)
+        if (history.Count > 0 && !historyFromDb)
         {
-            // Replace DB contents with fresh parse (events.jsonl may have grown since last DB sync)
+            // events.jsonl was richer — sync to DB (normal case)
             await _chatDb.BulkInsertAsync(sessionId, history);
         }
 
@@ -1724,11 +1834,11 @@ public partial class CopilotService : IAsyncDisposable
             // The SDK may start writing events to the new dir after ResumeSessionAsync returns,
             // but our copy runs immediately and the new dir typically has no events yet.
             CopyEventsToNewSession(sessionId, actualSessionId);
-            var actualHistory = LoadHistoryFromDisk(actualSessionId);
+            var (actualHistory, actualFromDb) = await LoadBestHistoryAsync(actualSessionId);
             if (actualHistory.Count >= history.Count)
                 history = actualHistory;
             sessionId = actualSessionId;
-            if (history.Count > 0)
+            if (history.Count > 0 && !actualFromDb)
                 await _chatDb.BulkInsertAsync(sessionId, history);
         }
 
@@ -2960,6 +3070,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                             Debug($"[RECONNECT] Session ID changed on resume: '{state.Info.SessionId}' → '{actualId}' for '{sessionName}'");
                             CopyEventsToNewSession(state.Info.SessionId, actualId);
                             state.Info.SessionId = actualId;
+                            // Persist the new session ID so restarts don't revert to the old one
+                            FlushSaveActiveSessionsToDisk();
                         }
                     }
                     catch (Exception resumeEx) when (resumeEx.Message.Contains("Session not found", StringComparison.OrdinalIgnoreCase))
@@ -2973,6 +3085,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                             var freshConfig = BuildFreshSessionConfig(state);
                             newSession = await client.CreateSessionAsync(freshConfig, cancellationToken);
                             state.Info.SessionId = newSession.SessionId;
+                            FlushSaveActiveSessionsToDisk();
                         }
                         catch (Exception createEx)
                         {
@@ -2999,6 +3112,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                             var freshConfig = BuildFreshSessionConfig(state);
                             newSession = await client.CreateSessionAsync(freshConfig, cancellationToken);
                             state.Info.SessionId = newSession.SessionId;
+                            FlushSaveActiveSessionsToDisk();
                         }
                         catch (Exception createEx)
                         {
@@ -3916,6 +4030,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             CancelProcessingWatchdog(state);
             CancelTurnEndFallback(state);
             CancelToolHealthCheck(state);
+            DisposePrematureIdleSignal(state);
             if (state.Session is not null)
                 try { await state.Session.DisposeAsync(); } catch { }
         }

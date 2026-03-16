@@ -442,6 +442,15 @@ public partial class CopilotService
                                     ? "⚠️ Shell environment broken (posix_spawn failed). Attempting to reconnect session..."
                                     : "⚠️ Permission errors detected. Attempting to reconnect session...";
                                 state.Info.History.Add(ChatMessage.SystemMessage(msg));
+
+                                // For shell failures: also set the server health banner so the user
+                                // can restart the entire headless server (the root cause is stale
+                                // native modules, not a session-level issue)
+                                if (isShellFailure && CurrentMode == ConnectionMode.Persistent)
+                                {
+                                    ServerHealthNotice = "Shell environment broken — the headless server's native modules may be stale (posix_spawn failed). Restart the server to fix.";
+                                }
+
                                 OnStateChanged?.Invoke();
                                 _ = TryRecoverPermissionAsync(state, sessionName);
                             });
@@ -2075,6 +2084,22 @@ public partial class CopilotService
                                             // Multi-agent workers get a much longer window because the SDK
                                             // can pause event delivery for 10+ min during long tool runs.
                                             caseBEventsActive = lastWrite > startedAt.Value && age < freshnessSeconds;
+
+                                            // Even if the file looks fresh, check if the server shut down
+                                            // the session. session.shutdown is written to events.jsonl when
+                                            // the server kills a session (idle timeout, stuck tools, etc.)
+                                            // but the client event stream may be dead so we never received it.
+                                            // Same pattern as HasInterruptedToolExecution in Utilities.cs.
+                                            if (caseBEventsActive)
+                                            {
+                                                var lastEventType = GetLastEventType(ep);
+                                                if (lastEventType == "session.shutdown")
+                                                {
+                                                    Debug($"[WATCHDOG] '{sessionName}' Case B — events.jsonl ends with session.shutdown, " +
+                                                          $"skipping deferral (server killed session)");
+                                                    caseBEventsActive = false;
+                                                }
+                                            }
                                         }
                                     }
                                 }

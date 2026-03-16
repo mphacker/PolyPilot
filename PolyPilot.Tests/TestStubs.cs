@@ -28,6 +28,9 @@ internal class StubChatDatabase : IChatDatabase
 
     public Task UpdateReasoningContentAsync(string sessionId, string reasoningId, string content, bool isComplete)
         => Task.CompletedTask;
+
+    public Task<List<ChatMessage>> GetAllMessagesAsync(string sessionId)
+        => Task.FromResult(new List<ChatMessage>());
 }
 
 #pragma warning disable CS0067 // Events declared but never used in stubs

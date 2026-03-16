@@ -138,6 +138,43 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Reads the last non-empty line of events.jsonl and returns its "type" field.
+    /// Used by the watchdog to detect session.shutdown without parsing the full file.
+    /// Returns null if the file doesn't exist, is empty, or can't be parsed.
+    /// Uses a tail-read (last 4KB) to avoid O(N) full-file scan on large sessions.
+    /// </summary>
+    internal static string? GetLastEventType(string eventsFilePath)
+    {
+        try
+        {
+            if (!File.Exists(eventsFilePath)) return null;
+
+            // Read only the tail of the file (last 4KB is plenty for the last JSON line)
+            const int tailBytes = 4096;
+            using var fs = new FileStream(eventsFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            if (fs.Length == 0) return null;
+
+            var offset = Math.Max(0, fs.Length - tailBytes);
+            fs.Seek(offset, SeekOrigin.Begin);
+            using var reader = new StreamReader(fs);
+            string? lastLine = null;
+            while (reader.ReadLine() is { } line)
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                    lastLine = line;
+            }
+            if (lastLine == null) return null;
+
+            using var doc = System.Text.Json.JsonDocument.Parse(lastLine);
+            return doc.RootElement.GetProperty("type").GetString();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Checks whether events.jsonl shows a session that was interrupted mid-tool-execution.
     /// Returns true if the last non-control events are tool.execution_start without matching
     /// tool.execution_complete, AND a session.shutdown occurred after them (proving the tools
@@ -636,6 +673,55 @@ public partial class CopilotService
         {
             return new List<ChatMessage>();
         }
+    }
+
+    /// <summary>
+    /// Load session history from the best available source: events.jsonl or chat_history.db.
+    /// The SDK's event file writer can break after server-side session cleanup + re-resume,
+    /// causing events to flow in-memory but never persist to events.jsonl ("dead event stream").
+    /// ChatDatabase is written fire-and-forget on every message and survives this failure mode.
+    /// 
+    /// Strategy: compare the latest user message timestamp from each source. Whichever has
+    /// the most recent user interaction wins entirely — no merging, no risk of duplicates.
+    /// Returns (history, fromDatabase) — fromDatabase=true means events.jsonl was stale.
+    /// </summary>
+    private async Task<(List<ChatMessage> History, bool FromDatabase)> LoadBestHistoryAsync(string sessionId)
+    {
+        var eventsHistory = await LoadHistoryFromDiskAsync(sessionId);
+
+        List<ChatMessage> dbHistory;
+        try
+        {
+            dbHistory = await _chatDb.GetAllMessagesAsync(sessionId);
+        }
+        catch
+        {
+            return (eventsHistory, false);
+        }
+
+        if (dbHistory.Count == 0)
+            return (eventsHistory, false);
+
+        if (eventsHistory.Count == 0)
+            return (dbHistory, true);
+
+        // Compare the latest user message timestamp from each source.
+        // Whichever has the most recent user interaction is the better source.
+        var eventsLatestUser = eventsHistory
+            .Where(m => m.MessageType == ChatMessageType.User)
+            .MaxBy(m => m.Timestamp)?.Timestamp ?? DateTime.MinValue;
+
+        var dbLatestUser = dbHistory
+            .Where(m => m.MessageType == ChatMessageType.User)
+            .MaxBy(m => m.Timestamp)?.Timestamp ?? DateTime.MinValue;
+
+        if (dbLatestUser > eventsLatestUser && (dbLatestUser - eventsLatestUser).TotalSeconds > 5)
+        {
+            Debug($"[HISTORY-RECOVERY] ChatDatabase has newer messages (DB latest={dbLatestUser:u}, events latest={eventsLatestUser:u}) for session {sessionId} — using DB");
+            return (dbHistory, true);
+        }
+
+        return (eventsHistory, false);
     }
 
     // Dock badge for completed sessions
