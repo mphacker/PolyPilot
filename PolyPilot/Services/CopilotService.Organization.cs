@@ -48,7 +48,7 @@ public partial class CopilotService
 
     /// <summary>Maximum time to wait for the worker's real completion after detecting a
     /// premature session.idle re-arm. Workers with long tool runs can take minutes.</summary>
-    internal const int PrematureIdleRecoveryTimeoutMs = 120_000;
+    internal const int PrematureIdleRecoveryTimeoutMs = 300_000;
 
     // Per-session semaphores to prevent concurrent model switches during rapid dispatch
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _modelSwitchLocks = new();
@@ -1870,8 +1870,11 @@ public partial class CopilotService
                   $"using original response ({initialResponse?.Length ?? 0} chars)");
             return initialResponse;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
+            // Catches both: (1) outer cancellation (user abort) and (2) inner recoveryCts
+            // timeout. Without this, the 120s recovery OCE escapes to ExecuteWorkerAsync's
+            // generic catch, which logs FAILED and discards bestResponse.
             return bestResponse ?? initialResponse;
         }
     }
