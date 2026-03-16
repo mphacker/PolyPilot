@@ -36,6 +36,20 @@ public partial class CopilotService
     private static readonly TimeSpan WorkerExecutionTimeout = TimeSpan.FromMinutes(60);
     private static readonly TimeSpan WorkerExecutionTimeoutRemote = TimeSpan.FromMinutes(10);
 
+    /// <summary>How long to poll for premature idle indicators after the initial TCS completes.
+    /// Checks both WasPrematurelyIdled flag (set by EVT-REARM) and events.jsonl freshness
+    /// (CLI still writing events). The events.jsonl check catches cases where EVT-REARM
+    /// takes 30-60s to fire.</summary>
+    internal const int PrematureIdleDetectionWindowMs = 10_000;
+
+    /// <summary>If events.jsonl was modified within this many seconds of TCS completion,
+    /// the worker is likely still active despite the premature session.idle.</summary>
+    internal const int PrematureIdleEventsFileFreshnessSeconds = 15;
+
+    /// <summary>Maximum time to wait for the worker's real completion after detecting a
+    /// premature session.idle re-arm. Workers with long tool runs can take minutes.</summary>
+    internal const int PrematureIdleRecoveryTimeoutMs = 120_000;
+
     // Per-session semaphores to prevent concurrent model switches during rapid dispatch
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _modelSwitchLocks = new();
 
@@ -1465,7 +1479,7 @@ public partial class CopilotService
         var workerPrompt = BuildWorkerPrompt(identity, worktreeNote, sharedPrefix, originalPrompt, task);
 
         const int maxRetries = 2;
-        var dispatchTime = DateTime.UtcNow;
+        var dispatchTime = DateTime.Now;
 
         // Pre-dispatch: if worker is still processing from a previous run (e.g., restored
         // mid-processing after app relaunch), wait for it to become idle. The watchdog will
@@ -1497,6 +1511,17 @@ public partial class CopilotService
                 Debug($"[DISPATCH] Worker '{workerName}' starting (prompt len={workerPrompt.Length}, attempt={attempt})");
                 var response = await SendPromptAndWaitAsync(workerName, workerPrompt, cancellationToken, originalPrompt: originalPrompt);
 
+                // Premature session.idle recovery (SDK bug #299):
+                // The SDK sometimes sends session.idle mid-turn, completing the TCS with
+                // truncated content. The EVT-REARM path detects the follow-up TurnStartEvent
+                // and sets WasPrematurelyIdled=true. Poll briefly for this flag, then wait
+                // for the worker's real completion and re-collect full content from History.
+                if (_sessions.TryGetValue(workerName, out var postState) && postState.IsMultiAgentSession)
+                {
+                    response = await RecoverFromPrematureIdleIfNeededAsync(
+                        workerName, postState, response, dispatchTime, cancellationToken);
+                }
+
                 // Worker revival: empty response means the session died (e.g., dead SSE stream
                 // after reconnect). Create a fresh session and retry once.
                 if (string.IsNullOrWhiteSpace(response))
@@ -1504,6 +1529,8 @@ public partial class CopilotService
                     Debug($"[DISPATCH] Worker '{workerName}' returned empty — attempting fresh session revival");
                     if (_sessions.TryGetValue(workerName, out var deadState))
                     {
+                        // Mark old state as orphaned so any lingering callbacks are no-ops
+                        deadState.IsOrphaned = true;
                         try { await deadState.Session.DisposeAsync(); } catch { }
 
                         var workerMeta = GetSessionMeta(workerName);
@@ -1512,11 +1539,30 @@ public partial class CopilotService
                         {
                             var freshConfig = BuildFreshSessionConfig(deadState);
                             var freshSession = await client.CreateSessionAsync(freshConfig, cancellationToken);
-                            deadState.Info.SessionId = freshSession.SessionId;
                             var freshState = new SessionState { Session = freshSession, Info = deadState.Info };
-                            _sessions[workerName] = freshState;
-                            Debug($"[DISPATCH] Worker '{workerName}' revived with fresh session '{freshSession.SessionId}'");
-                            response = await SendPromptAndWaitAsync(workerName, workerPrompt, cancellationToken, originalPrompt: originalPrompt);
+                            freshState.IsMultiAgentSession = deadState.IsMultiAgentSession;
+                            // Register event handler BEFORE sending — without this, the SDK
+                            // writes events.jsonl but HandleSessionEvent never fires, creating
+                            // a dead event stream where the watchdog is the only recovery path.
+                            freshSession.On(evt => HandleSessionEvent(freshState, evt));
+                            // Use TryUpdate for atomic swap — prevents a stale Task.Run
+                            // from a concurrent reconnect from overwriting newer state (INV-15).
+                            if (!_sessions.TryUpdate(workerName, freshState, deadState))
+                            {
+                                Debug($"[DISPATCH] Worker '{workerName}' revival state already replaced — discarding");
+                                freshState.IsOrphaned = true;
+                                try { await freshSession.DisposeAsync(); } catch { }
+                                DisposePrematureIdleSignal(deadState);
+                            }
+                            else
+                            {
+                                // Commit SessionId only after TryUpdate succeeds — avoids
+                                // mutating shared Info on a path that might discard the state.
+                                deadState.Info.SessionId = freshSession.SessionId;
+                                DisposePrematureIdleSignal(deadState);
+                                Debug($"[DISPATCH] Worker '{workerName}' revived with fresh session '{freshSession.SessionId}'");
+                                response = await SendPromptAndWaitAsync(workerName, workerPrompt, cancellationToken, originalPrompt: originalPrompt);
+                            }
                         }
                     }
                 }
@@ -1578,10 +1624,11 @@ public partial class CopilotService
                         {
                             try
                             {
-                                var diskHistory = LoadHistoryFromDisk(sessionId);
+                                var diskHistory = await LoadHistoryFromDiskAsync(sessionId);
                                 var lastDiskAssistant = diskHistory
                                     .LastOrDefault(m => m.Role == "assistant" && !string.IsNullOrWhiteSpace(m.Content)
-                                        && m.MessageType == ChatMessageType.Assistant);
+                                        && m.MessageType == ChatMessageType.Assistant
+                                        && m.Timestamp >= dispatchTime);
                                 if (lastDiskAssistant != null)
                                 {
                                     response = lastDiskAssistant.Content;
@@ -1640,6 +1687,210 @@ public partial class CopilotService
                 s.ResponseCompletion?.TrySetCanceled();
         });
         return await SendPromptAsync(sessionName, prompt, cancellationToken: cts.Token, originalPrompt: originalPrompt);
+    }
+
+    /// <summary>
+    /// Detects premature session.idle (SDK bug #299) and recovers the full worker response.
+    /// After the initial TCS completes, polls briefly for the WasPrematurelyIdled flag set by
+    /// EVT-REARM. If detected, subscribes to OnSessionComplete and waits for the worker's real
+    /// completion, then re-collects full content from History or events.jsonl.
+    /// </summary>
+    private async Task<string?> RecoverFromPrematureIdleIfNeededAsync(
+        string workerName, SessionState state, string? initialResponse,
+        DateTime dispatchTime, CancellationToken cancellationToken)
+    {
+        // Two detection signals (either triggers recovery):
+        // 1. PrematureIdleSignal (ManualResetEventSlim) — set by EVT-REARM, event-based (efficient)
+        // 2. events.jsonl freshness — CLI is still writing events despite our TCS completing
+        //    This catches cases where EVT-REARM takes 30-60s to fire
+        
+        bool IsPrematureIdleSignalSet()
+        {
+            try { return state.PrematureIdleSignal.IsSet; }
+            catch (ObjectDisposedException) { return false; }
+        }
+
+        bool WaitForPrematureIdleSignal()
+        {
+            try { return state.PrematureIdleSignal.Wait(500, cancellationToken); }
+            catch (ObjectDisposedException) { return false; }
+        }
+
+        // Fast path: check if PrematureIdleSignal was already set
+        var detected = IsPrematureIdleSignalSet();
+        
+        if (!detected)
+        {
+            // Check events.jsonl freshness immediately — if the file was just written,
+            // the CLI is still actively working despite the premature session.idle
+            detected = IsEventsFileActive(state.Info.SessionId);
+        }
+        
+        if (!detected)
+        {
+            // Wait for PrematureIdleSignal OR poll events.jsonl freshness
+            var detectStart = DateTime.UtcNow;
+            while ((DateTime.UtcNow - detectStart).TotalMilliseconds < PrematureIdleDetectionWindowMs)
+            {
+                // Wait up to 500ms on the signal (exits immediately if Set())
+                var signaled = await Task.Run(WaitForPrematureIdleSignal, cancellationToken)
+                    .ConfigureAwait(false);
+                
+                if (signaled || cancellationToken.IsCancellationRequested)
+                {
+                    detected = signaled;
+                    break;
+                }
+                
+                // Re-check events.jsonl freshness each cycle
+                if (IsEventsFileActive(state.Info.SessionId))
+                {
+                    detected = true;
+                    break;
+                }
+            }
+        }
+
+        if (!detected)
+            return initialResponse; // Normal completion — no premature idle indicators
+
+        var signal = IsPrematureIdleSignalSet() ? "PrematureIdleSignal" : "events.jsonl freshness";
+        Debug($"[DISPATCH-RECOVER] Worker '{workerName}' premature idle detected via {signal} — " +
+              $"truncated response={initialResponse?.Length ?? 0} chars, " +
+              $"IsProcessing={state.Info.IsProcessing}. Waiting for real completion...");
+
+        // The worker may hit premature idle repeatedly (observed: 4x in a row),
+        // so we loop until events.jsonl goes stale (worker truly done).
+        string? bestResponse = initialResponse;
+        try
+        {
+            using var recoveryCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            recoveryCts.CancelAfter(PrematureIdleRecoveryTimeoutMs);
+            var rounds = 0;
+            
+            while (!recoveryCts.Token.IsCancellationRequested)
+            {
+                rounds++;
+                var completionTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                void LocalHandler(string name, string _)
+                {
+                    if (name == workerName)
+                        completionTcs.TrySetResult(true);
+                }
+                OnSessionComplete += LocalHandler;
+                
+                try
+                {
+                    // If worker already finished while we were setting up, complete immediately
+                    if (!state.Info.IsProcessing)
+                        completionTcs.TrySetResult(true);
+
+                    await using var reg = recoveryCts.Token.Register(() => completionTcs.TrySetResult(false));
+                    var completed = await completionTcs.Task;
+                    if (!completed)
+                    {
+                        Debug($"[DISPATCH-RECOVER] Worker '{workerName}' recovery timed out after {PrematureIdleRecoveryTimeoutMs / 1000}s " +
+                              $"(round {rounds}) — using best response ({bestResponse?.Length ?? 0} chars)");
+                        break;
+                    }
+                    
+                    // Collect content from this completion round
+                    ChatMessage[] histSnapshot;
+                    try { histSnapshot = state.Info.History.ToArray(); }
+                    catch (InvalidOperationException) { histSnapshot = Array.Empty<ChatMessage>(); }
+
+                    var latestContent = histSnapshot
+                        .LastOrDefault(m => m.Role == "assistant" && !string.IsNullOrWhiteSpace(m.Content)
+                            && m.MessageType == ChatMessageType.Assistant
+                            && m.Timestamp >= dispatchTime);
+
+                    if (latestContent != null && latestContent.Content!.Length > (bestResponse?.Length ?? 0))
+                    {
+                        bestResponse = latestContent.Content;
+                        Debug($"[DISPATCH-RECOVER] Worker '{workerName}' round {rounds}: collected {bestResponse.Length} chars from History");
+                    }
+                    
+                    // Check if the worker is truly done or will hit premature idle again
+                    try { await Task.Delay(2000, recoveryCts.Token); } // Brief settle time
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { break; }
+                    
+                    if (!IsEventsFileActive(state.Info.SessionId) && !state.Info.IsProcessing)
+                    {
+                        Debug($"[DISPATCH-RECOVER] Worker '{workerName}' events.jsonl stale and not processing " +
+                              $"after round {rounds} — worker is truly done ({bestResponse?.Length ?? 0} chars)");
+                        break;
+                    }
+                    
+                    if (state.Info.IsProcessing)
+                    {
+                        Debug($"[DISPATCH-RECOVER] Worker '{workerName}' still processing after round {rounds} " +
+                              $"(re-armed again) — waiting for next completion...");
+                    }
+                }
+                finally
+                {
+                    OnSessionComplete -= LocalHandler;
+                }
+            }
+
+            // If History didn't have better content, try disk fallback
+            if ((bestResponse?.Length ?? 0) <= (initialResponse?.Length ?? 0))
+            {
+                var sessionId = state.Info.SessionId;
+                if (!string.IsNullOrEmpty(sessionId))
+                {
+                    try
+                    {
+                        var diskHistory = await LoadHistoryFromDiskAsync(sessionId);
+                        var lastDisk = diskHistory
+                            .LastOrDefault(m => m.Role == "assistant" && !string.IsNullOrWhiteSpace(m.Content)
+                                && m.MessageType == ChatMessageType.Assistant
+                                && m.Timestamp >= dispatchTime);
+                        if (lastDisk != null && lastDisk.Content!.Length > (bestResponse?.Length ?? 0))
+                        {
+                            Debug($"[DISPATCH-RECOVER] Worker '{workerName}' recovered {lastDisk.Content.Length} chars from events.jsonl");
+                            return lastDisk.Content;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug($"[DISPATCH-RECOVER] Worker '{workerName}' events.jsonl recovery failed: {ex.Message}");
+                    }
+                }
+            }
+
+            if ((bestResponse?.Length ?? 0) > (initialResponse?.Length ?? 0))
+            {
+                Debug($"[DISPATCH-RECOVER] Worker '{workerName}' final recovery: {bestResponse!.Length} chars " +
+                      $"(was {initialResponse?.Length ?? 0} chars truncated, {rounds} rounds)");
+                return bestResponse;
+            }
+
+            Debug($"[DISPATCH-RECOVER] Worker '{workerName}' recovery found no additional content after {rounds} rounds — " +
+                  $"using original response ({initialResponse?.Length ?? 0} chars)");
+            return initialResponse;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return bestResponse ?? initialResponse;
+        }
+    }
+
+    /// <summary>Check if a session's events.jsonl was recently modified, indicating the CLI
+    /// is still actively working. Used by premature idle recovery to detect truncation
+    /// when EVT-REARM hasn't fired yet.</summary>
+    private bool IsEventsFileActive(string? sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return false;
+        try
+        {
+            var eventsPath = Path.Combine(SessionStatePath, sessionId, "events.jsonl");
+            if (!File.Exists(eventsPath)) return false;
+            var lastWrite = File.GetLastWriteTimeUtc(eventsPath);
+            var fileAge = (DateTime.UtcNow - lastWrite).TotalSeconds;
+            return fileAge < PrematureIdleEventsFileFreshnessSeconds;
+        }
+        catch { return false; }
     }
 
     private static string BuildWorkerPrompt(string identity, string worktreeNote, string sharedPrefix, string originalPrompt, string task)
@@ -1869,10 +2120,11 @@ public partial class CopilotService
                 {
                     try
                     {
-                        var diskHistory = LoadHistoryFromDisk(session.SessionId);
+                        var diskHistory = await LoadHistoryFromDiskAsync(session.SessionId);
                         var lastDiskAssistant = diskHistory
                             .LastOrDefault(m => m.Role == "assistant" && !string.IsNullOrWhiteSpace(m.Content)
-                                && m.MessageType == ChatMessageType.Assistant);
+                                && m.MessageType == ChatMessageType.Assistant
+                                && m.Timestamp >= dispatchTimeLocal);
                         if (lastDiskAssistant != null)
                         {
                             diskResponse = lastDiskAssistant.Content;

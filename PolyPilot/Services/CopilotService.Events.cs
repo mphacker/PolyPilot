@@ -510,12 +510,36 @@ public partial class CopilotService
                 var phaseAdvancedToThinking = state.Info.ProcessingPhase < 2;
                 if (phaseAdvancedToThinking) state.Info.ProcessingPhase = 2; // Thinking
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
-                Invoke(() =>
+                // Premature session.idle recovery: the SDK sometimes sends session.idle
+                // mid-turn, then continues processing (ghost events). If we receive a
+                // TurnStart after IsProcessing was already cleared, re-arm processing
+                // so the UI shows the session as active and content is properly captured
+                // via the normal CompleteResponse path on the next session.idle.
+                if (!state.Info.IsProcessing && isCurrentState && !state.IsOrphaned)
                 {
-                    OnTurnStart?.Invoke(sessionName);
-                    OnActivity?.Invoke(sessionName, "🤔 Thinking...");
-                    if (phaseAdvancedToThinking) NotifyStateChangedCoalesced();
-                });
+                    Debug($"[EVT-REARM] '{sessionName}' TurnStartEvent arrived after premature session.idle — re-arming IsProcessing");
+                    state.PrematureIdleSignal.Set(); // Signal to ExecuteWorkerAsync that TCS result was truncated
+                    Invoke(() =>
+                    {
+                        if (state.IsOrphaned) return;
+                        state.Info.IsProcessing = true;
+                        state.Info.ProcessingPhase = 2;
+                        state.Info.ProcessingStartedAt ??= DateTime.UtcNow;
+                        StartProcessingWatchdog(state, sessionName);
+                        OnTurnStart?.Invoke(sessionName);
+                        OnActivity?.Invoke(sessionName, "🤔 Thinking...");
+                        NotifyStateChangedCoalesced();
+                    });
+                }
+                else
+                {
+                    Invoke(() =>
+                    {
+                        OnTurnStart?.Invoke(sessionName);
+                        OnActivity?.Invoke(sessionName, "🤔 Thinking...");
+                        if (phaseAdvancedToThinking) NotifyStateChangedCoalesced();
+                    });
+                }
                 break;
 
             case AssistantTurnEndEvent:
@@ -2316,6 +2340,7 @@ public partial class CopilotService
             state.ResponseCompletion?.TrySetCanceled();
 
             // Create new state preserving Info
+            var oldState = state;
             var newState = new SessionState
             {
                 Session = newSession,
@@ -2337,6 +2362,7 @@ public partial class CopilotService
             // Replace in sessions dictionary BEFORE registering event handler
             // so HandleSessionEvent's isCurrentState check passes for the new state.
             _sessions[sessionName] = newState;
+            DisposePrematureIdleSignal(oldState);
             newSession.On(evt => HandleSessionEvent(newState, evt));
 
             // Bug A fix: Clear IsProcessing + all 9 companion fields so SendPromptAsync

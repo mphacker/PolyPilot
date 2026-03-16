@@ -1,4 +1,5 @@
 using System.Text.Json;
+using GitHub.Copilot.SDK;
 using PolyPilot.Models;
 
 namespace PolyPilot.Services;
@@ -291,6 +292,126 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Check if a session belongs to a codespace group.
+    /// </summary>
+    private bool IsCodespaceSession(string sessionName)
+    {
+        // Use snapshots for thread safety — may be called from background threads
+        var metas = SnapshotSessionMetas();
+        var meta = metas.FirstOrDefault(m => m.SessionName == sessionName);
+        if (meta?.GroupId == null) return false;
+        var groups = SnapshotGroups();
+        var group = groups.FirstOrDefault(g => g.Id == meta.GroupId);
+        return group?.IsCodespace == true;
+    }
+
+    /// <summary>
+    /// Lazily connect a placeholder session to the SDK. Called on first interaction
+    /// (send message) with a session that was loaded at startup without an SDK connection.
+    /// </summary>
+    private async Task EnsureSessionConnectedAsync(string sessionName, SessionState state, CancellationToken cancellationToken)
+    {
+        var connectLock = _sessionConnectLocks.GetOrAdd(sessionName, _ => new SemaphoreSlim(1, 1));
+        await connectLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (state.Session != null) return; // already connected
+
+            var sessionId = state.Info.SessionId;
+            if (string.IsNullOrEmpty(sessionId) || !Guid.TryParse(sessionId, out _))
+                throw new InvalidOperationException($"Session '{sessionName}' has no valid session ID for resume.");
+
+            if (!IsInitialized || _client == null)
+                throw new InvalidOperationException("Copilot is not connected yet. Go to Settings to configure.");
+
+            Debug($"Lazy-resuming session '{sessionName}' (id={sessionId})...");
+
+            // Use snapshot for thread safety — may be called from ThreadPool via SendPromptAsync
+            var groupId = SnapshotSessionMetas().FirstOrDefault(m => m.SessionName == sessionName)?.GroupId;
+            var resumeModel = state.Info.Model ?? DefaultModel;
+            var resumeWorkDir = state.Info.WorkingDirectory;
+
+            var resumeConfig = new ResumeSessionConfig
+            {
+                Model = resumeModel,
+                WorkingDirectory = resumeWorkDir,
+                Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
+                OnPermissionRequest = AutoApprovePermissions
+            };
+
+            CopilotSession copilotSession;
+            try
+            {
+                copilotSession = await GetClientForGroup(groupId).ResumeSessionAsync(sessionId, resumeConfig, cancellationToken);
+            }
+            catch (Exception ex) when (
+                ex.Message.Contains("Session not found", StringComparison.OrdinalIgnoreCase) ||
+                ex.Message.Contains("corrupt", StringComparison.OrdinalIgnoreCase) ||
+                ex.Message.Contains("session file", StringComparison.OrdinalIgnoreCase) ||
+                IsProcessError(ex))
+            {
+                Debug($"Lazy-resume failed for '{sessionName}': {ex.Message} — creating fresh session");
+                copilotSession = await GetClientForGroup(groupId).CreateSessionAsync(new SessionConfig
+                {
+                    Model = resumeModel,
+                    WorkingDirectory = resumeWorkDir,
+                    Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
+                    OnPermissionRequest = AutoApprovePermissions
+                }, cancellationToken);
+                state.Info.SessionId = copilotSession.SessionId;
+                FlushSaveActiveSessionsToDisk();
+            }
+
+            state.Session = copilotSession;
+            state.IsMultiAgentSession = IsSessionInMultiAgentGroup(sessionName);
+            copilotSession.On(evt => HandleSessionEvent(state, evt));
+            Debug($"Lazy-resume complete: '{sessionName}'");
+        }
+        finally
+        {
+            connectLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Background wrapper for session restore + post-restore tasks.
+    /// Runs off the UI thread so the app renders immediately on launch.
+    /// </summary>
+    private async Task RestoreSessionsInBackgroundAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await RestorePreviousSessionsAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Debug($"Background restore failed: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            IsRestoring = false;
+
+            // Flush session list so recreated session IDs are persisted
+            FlushSaveActiveSessionsToDisk();
+
+            if (CodespacesEnabled)
+                StartCodespaceHealthCheck();
+
+            // ReconcileOrganization reads/writes Organization.Sessions (a plain List<T>)
+            // which is not thread-safe. Now that restore runs on ThreadPool via Task.Run,
+            // we must marshal this to the UI thread to avoid concurrent enumeration crashes.
+            InvokeOnUI(() =>
+            {
+                ReconcileOrganization();
+                OnStateChanged?.Invoke();
+            });
+
+            // Resume any pending orchestration dispatch interrupted by relaunch
+            _ = ResumeOrchestrationIfPendingAsync(cancellationToken);
+        }
+    }
+
+    /// <summary>
     /// Load and resume all previously active sessions
     /// </summary>
     public async Task RestorePreviousSessionsAsync(CancellationToken cancellationToken = default)
@@ -299,7 +420,7 @@ public partial class CopilotService
         {
             try
             {
-                var json = await File.ReadAllTextAsync(ActiveSessionsFile, cancellationToken);
+                var json = await File.ReadAllTextAsync(ActiveSessionsFile, cancellationToken).ConfigureAwait(false);
                 var entries = JsonSerializer.Deserialize<List<ActiveSessionEntry>>(json);
                 if (entries != null && entries.Count > 0)
                 {
@@ -326,6 +447,8 @@ public partial class CopilotService
                         if (g.ReflectionState?.IsActive == true && !string.IsNullOrEmpty(g.ReflectionState.EvaluatorSessionName))
                             activeEvaluators.Add(g.ReflectionState.EvaluatorSessionName);
                     }
+
+                    var eagerResumeCandidates = new List<(string SessionName, SessionState State)>();
 
                     foreach (var entry in entries)
                     {
@@ -390,9 +513,40 @@ public partial class CopilotService
                                 continue;
                             }
 
-                            await ResumeSessionAsync(entry.SessionId, entry.DisplayName, entry.WorkingDirectory, entry.Model, cancellationToken, entry.LastPrompt, entry.GroupId);
+                            // Create lightweight placeholder — actual SDK resume happens lazily
+                            // when user sends a message (EnsureSessionConnectedAsync).
+                            // This avoids 41 sequential SDK connections blocking app startup.
+                            var lazyHistory = LoadHistoryFromDisk(entry.SessionId);
+                            var lazyModel = Models.ModelHelper.NormalizeToSlug(entry.Model ?? DefaultModel);
+                            if (string.IsNullOrEmpty(lazyModel)) lazyModel = DefaultModel;
+                            var lazyWorkDir = entry.WorkingDirectory ?? GetSessionWorkingDirectory(entry.SessionId);
+
+                            var lazyInfo = new AgentSessionInfo
+                            {
+                                Name = entry.DisplayName,
+                                Model = lazyModel,
+                                CreatedAt = DateTime.Now,
+                                SessionId = entry.SessionId,
+                                WorkingDirectory = lazyWorkDir
+                            };
+                            lazyInfo.GitBranch = GetGitBranch(lazyInfo.WorkingDirectory);
+                            foreach (var msg in lazyHistory) lazyInfo.History.Add(msg);
+                            lazyInfo.MessageCount = lazyInfo.History.Count;
+                            lazyInfo.LastReadMessageCount = lazyInfo.History.Count;
+                            // Mark stale incomplete tool calls / reasoning as complete
+                            foreach (var msg in lazyInfo.History.Where(m => (m.MessageType == ChatMessageType.ToolCall || m.MessageType == ChatMessageType.Reasoning) && !m.IsComplete))
+                                msg.IsComplete = true;
+
+                            var lazyState = new SessionState { Session = null!, Info = lazyInfo };
+                            _sessions[entry.DisplayName] = lazyState;
+                            _activeSessionName ??= entry.DisplayName;
                             RestoreUsageStats(entry);
-                            Debug($"Restored session: {entry.DisplayName}");
+                            if (!string.IsNullOrWhiteSpace(entry.LastPrompt))
+                            {
+                                eagerResumeCandidates.Add((entry.DisplayName, lazyState));
+                                Debug($"Queued eager resume for interrupted session: {entry.DisplayName}");
+                            }
+                            Debug($"Loaded session placeholder: {entry.DisplayName} ({lazyHistory.Count} messages)");
                         }
                         catch (Exception ex)
                         {
@@ -487,6 +641,29 @@ public partial class CopilotService
                                 }
                             }
                         }
+                    }
+
+                    if (eagerResumeCandidates.Count > 0)
+                    {
+                        var pendingResumes = eagerResumeCandidates.ToArray();
+                        _ = Task.Run(async () =>
+                        {
+                            foreach (var pendingResume in pendingResumes)
+                            {
+                                try
+                                {
+                                    await EnsureSessionConnectedAsync(pendingResume.SessionName, pendingResume.State, cancellationToken).ConfigureAwait(false);
+                                }
+                                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                                {
+                                    break;
+                                }
+                                catch (Exception resumeEx)
+                                {
+                                    Debug($"Eager resume failed for '{pendingResume.SessionName}': {resumeEx.Message}");
+                                }
+                            }
+                        }, cancellationToken);
                     }
                     
                     IsRestoring = false;

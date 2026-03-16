@@ -2121,4 +2121,471 @@ public class MultiAgentRegressionTests
     }
 
     #endregion
+
+    #region Orchestrator-Steer Conflict Tests (PR #375)
+
+    /// <summary>
+    /// CRITICAL REGRESSION: When a user sends a message to a busy orchestrator,
+    /// Dashboard must queue the message (EnqueueMessage) — NOT steer it.
+    /// Steering cancels the in-flight orchestration TCS via ProcessingGeneration bump,
+    /// which causes TaskCanceledException in SendToMultiAgentGroupAsync.
+    /// 
+    /// Bug scenario:
+    /// 1. User sends "review these PRs" → orchestrator starts dispatching workers
+    /// 2. User sends "also check PR #400" while orchestrator is still processing
+    /// 3. OLD: Dashboard sees IsProcessing=true → calls SteerSessionAsync → cancels orchestration
+    /// 4. FIX: Dashboard sees IsProcessing=true + orchestrator → calls EnqueueMessage → safe
+    /// </summary>
+    [Fact]
+    public void EnqueueMessage_QueuesDrainAfterCompletion()
+    {
+        var svc = CreateService();
+        CopilotService.SetBaseDirForTesting(TestSetup.TestBaseDir);
+
+        // Create a session via reflection helper
+        AddDummySessions(svc, "test-orch");
+        var info = svc.GetSession("test-orch")!;
+
+        // Enqueue a message
+        svc.EnqueueMessage("test-orch", "also check PR #400");
+
+        // The message should be queued
+        Assert.Equal(1, info.MessageQueue.Count);
+        var queued = info.MessageQueue.TryDequeue();
+        Assert.Equal("also check PR #400", queued);
+    }
+
+    [Fact]
+    public void EnqueueMessage_MultipleMessages_QueuedInOrder()
+    {
+        var svc = CreateService();
+        CopilotService.SetBaseDirForTesting(TestSetup.TestBaseDir);
+
+        AddDummySessions(svc, "test-orch");
+        var info = svc.GetSession("test-orch")!;
+
+        svc.EnqueueMessage("test-orch", "message 1");
+        svc.EnqueueMessage("test-orch", "message 2");
+        svc.EnqueueMessage("test-orch", "message 3");
+
+        Assert.Equal(3, info.MessageQueue.Count);
+
+        // Drain in order
+        Assert.Equal("message 1", info.MessageQueue.TryDequeue());
+        Assert.Equal("message 2", info.MessageQueue.TryDequeue());
+        Assert.Equal("message 3", info.MessageQueue.TryDequeue());
+    }
+
+    /// <summary>
+    /// Structural test: Dashboard.razor dispatch routing must check for orchestrator
+    /// sessions BEFORE the general steer path. This prevents the steer from canceling
+    /// in-flight orchestrations.
+    ///
+    /// Order must be:
+    /// 1. if (IsProcessing) → check GetOrchestratorGroupId → queue if orchestrator
+    /// 2. else → SteerSessionAsync (for regular sessions)
+    /// </summary>
+    [Fact]
+    public void DashboardDispatch_OrchestratorCheckBeforeSteer()
+    {
+        var dashboardPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Components", "Pages", "Dashboard.razor"));
+
+        Assert.True(File.Exists(dashboardPath), $"Dashboard.razor not found at {dashboardPath}");
+
+        var source = File.ReadAllText(dashboardPath);
+
+        // Find the IsProcessing block that contains both the orchestrator check and steer
+        var isProcessingIdx = source.IndexOf("if (session?.IsProcessing == true)");
+        Assert.True(isProcessingIdx >= 0, "Dashboard must have 'if (session?.IsProcessing == true)' check");
+
+        // Within the IsProcessing block, orchestrator check must come BEFORE steer
+        var orchCheckIdx = source.IndexOf("GetOrchestratorGroupId(sessionName)", isProcessingIdx);
+        var steerIdx = source.IndexOf("SteerSessionAsync(sessionName", isProcessingIdx);
+
+        Assert.True(orchCheckIdx >= 0, "Dashboard must call GetOrchestratorGroupId within the IsProcessing block");
+        Assert.True(steerIdx >= 0, "Dashboard must call SteerSessionAsync within the IsProcessing block");
+        Assert.True(orchCheckIdx < steerIdx,
+            $"GetOrchestratorGroupId (pos {orchCheckIdx}) must appear BEFORE " +
+            $"SteerSessionAsync (pos {steerIdx}) in the IsProcessing block. " +
+            "If steer fires first, it cancels the in-flight orchestration TCS.");
+    }
+
+    /// <summary>
+    /// Structural test: Dashboard must use EnqueueMessage (not SteerSessionAsync)
+    /// when the session is identified as an orchestrator.
+    /// </summary>
+    [Fact]
+    public void DashboardDispatch_OrchestratorUsesEnqueueNotSteer()
+    {
+        var dashboardPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Components", "Pages", "Dashboard.razor"));
+
+        var source = File.ReadAllText(dashboardPath);
+
+        // Find the orchestrator guard block
+        var orchCheckIdx = source.IndexOf("GetOrchestratorGroupId(sessionName)");
+        Assert.True(orchCheckIdx >= 0);
+
+        // Find the return statement after the EnqueueMessage in the orchestrator block
+        // The pattern should be: orchGroupId != null → EnqueueMessage → return
+        var orchBlockStart = orchCheckIdx;
+        var orchNullCheck = source.IndexOf("orchGroupId != null", orchBlockStart);
+        Assert.True(orchNullCheck >= 0, "Must check orchGroupId != null");
+
+        // Within the orchestrator block (between orchGroupId check and the next return),
+        // EnqueueMessage must be called
+        var nextReturn = source.IndexOf("return;", orchNullCheck);
+        Assert.True(nextReturn >= 0);
+
+        var orchBlock = source[orchNullCheck..nextReturn];
+        Assert.Contains("EnqueueMessage", orchBlock);
+        Assert.DoesNotContain("SteerSessionAsync", orchBlock);
+    }
+
+    /// <summary>
+    /// Structural test: The QUEUED_ORCH_BUSY diagnostic log tag must be present
+    /// in the orchestrator queue path. This ensures diagnostic tracing is maintained.
+    /// </summary>
+    [Fact]
+    public void DashboardDispatch_OrchestratorQueueHasDiagnosticLog()
+    {
+        var dashboardPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Components", "Pages", "Dashboard.razor"));
+
+        var source = File.ReadAllText(dashboardPath);
+
+        Assert.Contains("QUEUED_ORCH_BUSY", source);
+    }
+
+    /// <summary>
+    /// Non-orchestrator sessions that are processing should still be steered.
+    /// This ensures the fix only affects orchestrator sessions, not regular ones.
+    /// </summary>
+    [Fact]
+    public void DashboardDispatch_NonOrchestratorStillSteered()
+    {
+        var dashboardPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Components", "Pages", "Dashboard.razor"));
+
+        var source = File.ReadAllText(dashboardPath);
+
+        // After the orchestrator block (orchGroupId != null → EnqueueMessage → return),
+        // the steer path must still exist for non-orchestrator sessions
+        var orchReturnIdx = source.IndexOf("QUEUED_ORCH_BUSY");
+        Assert.True(orchReturnIdx >= 0);
+
+        // SteerSessionAsync should still appear AFTER the orchestrator block
+        var steerAfterOrch = source.IndexOf("SteerSessionAsync", orchReturnIdx);
+        Assert.True(steerAfterOrch >= 0,
+            "SteerSessionAsync must still be called for non-orchestrator sessions " +
+            "that are processing. The orchestrator check is a special case, not a replacement.");
+    }
+
+    /// <summary>
+    /// Tests that GetOrchestratorGroupId returns null for a session that IS in a
+    /// multi-agent group but as a worker (not orchestrator). This ensures workers
+    /// can still be steered normally.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorGroupId_WorkerInActiveGroup_ReturnsNull()
+    {
+        var svc = CreateService();
+        CopilotService.SetBaseDirForTesting(TestSetup.TestBaseDir);
+
+        var group = svc.CreateMultiAgentGroup("Steer Test Team", MultiAgentMode.Orchestrator);
+        svc.Organization.Sessions.Add(new SessionMeta
+        {
+            SessionName = "Steer Test Team-orchestrator",
+            GroupId = group.Id,
+            Role = MultiAgentRole.Orchestrator
+        });
+        svc.Organization.Sessions.Add(new SessionMeta
+        {
+            SessionName = "Steer Test Team-worker-1",
+            GroupId = group.Id,
+            Role = MultiAgentRole.Worker
+        });
+
+        // Workers should NOT be identified as orchestrators
+        Assert.Null(svc.GetOrchestratorGroupId("Steer Test Team-worker-1"));
+        // Workers can be steered without issue
+    }
+
+    /// <summary>
+    /// Long-running orchestrator scenario: when an orchestrator has been dispatching
+    /// workers for 10+ minutes and the user sends a follow-up, it must be queued.
+    /// This is the exact scenario from the PR Review Squad bug.
+    /// </summary>
+    [Fact]
+    public void LongRunningOrchestrator_UserFollowup_MustQueue()
+    {
+        var svc = CreateService();
+        CopilotService.SetBaseDirForTesting(TestSetup.TestBaseDir);
+
+        // Set up a multi-agent group with orchestrator
+        var group = svc.CreateMultiAgentGroup("Long Run Team", MultiAgentMode.Orchestrator);
+        AddDummySessions(svc, "Long Run Team-orchestrator");
+
+        svc.Organization.Sessions.Add(new SessionMeta
+        {
+            SessionName = "Long Run Team-orchestrator",
+            GroupId = group.Id,
+            Role = MultiAgentRole.Orchestrator
+        });
+
+        // Verify the orchestrator is detected
+        Assert.Equal(group.Id, svc.GetOrchestratorGroupId("Long Run Team-orchestrator"));
+
+        // User sends a follow-up while orchestrator is busy
+        svc.EnqueueMessage("Long Run Team-orchestrator", "also review PR #500");
+
+        // Message should be queued, NOT cause steering
+        var info = svc.GetSession("Long Run Team-orchestrator")!;
+        Assert.Equal(1, info.MessageQueue.Count);
+    }
+
+    #endregion
+
+    #region Premature Idle Recovery Tests (PR #375 — SDK bug #299)
+
+    [Fact]
+    public void PrematureIdleDetectionWindowMs_IsReasonable()
+    {
+        // The detection window must be long enough for EVT-REARM to fire on the UI thread
+        // after the premature idle, but short enough not to delay normal completions excessively.
+        Assert.True(CopilotService.PrematureIdleDetectionWindowMs >= 3000,
+            "Detection window must be >= 3s to allow UI thread EVT-REARM dispatch");
+        Assert.True(CopilotService.PrematureIdleDetectionWindowMs <= 10_000,
+            "Detection window must be <= 10s to avoid excessive delay on normal completions");
+    }
+
+    [Fact]
+    public void PrematureIdleRecoveryTimeoutMs_IsReasonable()
+    {
+        // Recovery timeout must accommodate workers with long tool runs (up to 10+ minutes)
+        // but not exceed the worker execution timeout.
+        Assert.True(CopilotService.PrematureIdleRecoveryTimeoutMs >= 60_000,
+            "Recovery timeout must be >= 60s to accommodate worker tool runs");
+        Assert.True(CopilotService.PrematureIdleRecoveryTimeoutMs <= 600_000,
+            "Recovery timeout must be <= 600s (10 min) to not exceed worker timeout");
+    }
+
+    [Fact]
+    public void PrematureIdleSignal_ExistsOnSessionState()
+    {
+        // ManualResetEventSlim signal must exist on SessionState for EVT-REARM → ExecuteWorkerAsync signaling
+        var field = typeof(CopilotService).GetNestedType("SessionState",
+            System.Reflection.BindingFlags.NonPublic)?
+            .GetField("PrematureIdleSignal");
+        Assert.NotNull(field);
+        Assert.True(field.FieldType == typeof(ManualResetEventSlim), "PrematureIdleSignal must be a ManualResetEventSlim");
+    }
+
+    [Fact]
+    public void PrematureIdleSignal_SetInRearmPath()
+    {
+        // Structural: the EVT-REARM path must call PrematureIdleSignal.Set()
+        var eventsPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Events.cs");
+        var source = File.ReadAllText(eventsPath);
+
+        // Find the EVT-REARM block
+        var rearmIdx = source.IndexOf("[EVT-REARM]", StringComparison.Ordinal);
+        Assert.True(rearmIdx >= 0, "EVT-REARM diagnostic tag must exist in Events.cs");
+
+        // Within the next 200 chars after the tag, PrematureIdleSignal must be set
+        var rearmBlock = source.Substring(rearmIdx, Math.Min(200, source.Length - rearmIdx));
+        Assert.Contains("PrematureIdleSignal.Set()", rearmBlock);
+    }
+
+    [Fact]
+    public void PrematureIdleSignal_ResetInSendPromptAsync()
+    {
+        // Structural: SendPromptAsync must reset PrematureIdleSignal on each new turn
+        var servicePath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs");
+        var source = File.ReadAllText(servicePath);
+
+        // Find SendPromptAsync method
+        var sendIdx = source.IndexOf("async Task<string> SendPromptAsync(", StringComparison.Ordinal);
+        Assert.True(sendIdx >= 0, "SendPromptAsync must exist in CopilotService.cs");
+
+        var sendBlock = source.Substring(sendIdx, Math.Min(5000, source.Length - sendIdx));
+        Assert.Contains("PrematureIdleSignal.Reset()", sendBlock);
+    }
+
+    [Fact]
+    public void RecoverFromPrematureIdleIfNeededAsync_ExistsInOrganization()
+    {
+        // Structural: the recovery method must exist and be called from ExecuteWorkerAsync
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        Assert.Contains("RecoverFromPrematureIdleIfNeededAsync", source);
+
+        // Must be called within ExecuteWorkerAsync (find the method definition, not a call site)
+        var execIdx = source.IndexOf("private async Task<WorkerResult> ExecuteWorkerAsync", StringComparison.Ordinal);
+        Assert.True(execIdx >= 0, "ExecuteWorkerAsync method definition must exist");
+        var execBlock = source.Substring(execIdx, Math.Min(5000, source.Length - execIdx));
+        Assert.Contains("RecoverFromPrematureIdleIfNeededAsync", execBlock);
+    }
+
+    [Fact]
+    public void RecoverFromPrematureIdleIfNeededAsync_OnlyForMultiAgentSessions()
+    {
+        // Structural: the recovery check must be guarded by IsMultiAgentSession
+        // to avoid adding latency to normal single-session completions
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        var execIdx = source.IndexOf("private async Task<WorkerResult> ExecuteWorkerAsync", StringComparison.Ordinal);
+        Assert.True(execIdx >= 0, "ExecuteWorkerAsync method definition must exist");
+        var execBlock = source.Substring(execIdx, Math.Min(5000, source.Length - execIdx));
+
+        // Must check IsMultiAgentSession before calling recovery
+        var recoveryIdx = execBlock.IndexOf("RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
+        Assert.True(recoveryIdx >= 0, "Recovery call must exist in ExecuteWorkerAsync");
+        var beforeRecovery = execBlock[..recoveryIdx];
+        Assert.Contains("IsMultiAgentSession", beforeRecovery);
+    }
+
+    [Fact]
+    public void RecoverFromPrematureIdleIfNeededAsync_SubscribesToOnSessionComplete()
+    {
+        // Structural: the recovery method must subscribe to OnSessionComplete to detect
+        // the worker's real completion (after premature idle re-arm)
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        // Find the method definition (not a call site)
+        var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync method definition must exist");
+        var methodBlock = source.Substring(methodIdx, Math.Min(8000, source.Length - methodIdx));
+
+        Assert.Contains("OnSessionComplete +=", methodBlock);
+        Assert.Contains("OnSessionComplete -=", methodBlock); // Must unsubscribe in finally
+    }
+
+    [Fact]
+    public void RecoverFromPrematureIdleIfNeededAsync_HasDiskFallback()
+    {
+        // Structural: if History doesn't have full content, fall back to LoadHistoryFromDisk
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        // Find the method definition (not a call site)
+        var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync method definition must exist");
+        var methodBlock = source.Substring(methodIdx, Math.Min(8000, source.Length - methodIdx));
+
+        Assert.Contains("LoadHistoryFromDisk", methodBlock);
+    }
+
+    [Fact]
+    public void RecoverFromPrematureIdleIfNeededAsync_HasDiagnosticLogging()
+    {
+        // Every recovery path must have diagnostic log entries
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        // Find the method definition (not a call site)
+        var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync method definition must exist");
+        var methodBlock = source.Substring(methodIdx, Math.Min(8000, source.Length - methodIdx));
+
+        Assert.Contains("[DISPATCH-RECOVER]", methodBlock);
+    }
+
+    [Fact]
+    public void MutationBeforeCommit_SessionIdSetAfterTryUpdate()
+    {
+        // Structural: SessionId must be set AFTER TryUpdate succeeds, not before.
+        // This prevents mutating shared Info on a path that might discard the state.
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        // Find the revival block in ExecuteWorkerAsync
+        var revivalIdx = source.IndexOf("revived with fresh session", StringComparison.Ordinal);
+        Assert.True(revivalIdx >= 0, "Revival debug message must exist");
+
+        // SessionId assignment must be near/after the "revived" message, not before TryUpdate
+        var tryUpdateIdx = source.IndexOf("TryUpdate(workerName, freshState, deadState)", StringComparison.Ordinal);
+        Assert.True(tryUpdateIdx >= 0, "TryUpdate call must exist");
+
+        // Find the SessionId assignment
+        var sessionIdAssign = source.IndexOf("deadState.Info.SessionId = freshSession.SessionId", StringComparison.Ordinal);
+        Assert.True(sessionIdAssign >= 0, "SessionId assignment must exist");
+        Assert.True(sessionIdAssign > tryUpdateIdx,
+            "SessionId must be assigned AFTER TryUpdate succeeds (mutation-after-commit pattern)");
+    }
+
+    [Fact]
+    public void RecoverFromPrematureIdleIfNeededAsync_UsesEventsFileFreshness()
+    {
+        // Structural: recovery must check events.jsonl freshness as a parallel detection
+        // signal alongside WasPrematurelyIdled flag. This catches cases where EVT-REARM
+        // takes 30-60s to fire but the CLI is still writing events.
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync method definition must exist");
+        var methodBlock = source.Substring(methodIdx, Math.Min(8000, source.Length - methodIdx));
+
+        Assert.Contains("IsEventsFileActive", methodBlock);
+    }
+
+    [Fact]
+    public void IsEventsFileActive_HelperExists()
+    {
+        // Structural: IsEventsFileActive must exist as a helper for events.jsonl freshness checks
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        var helperIdx = source.IndexOf("private bool IsEventsFileActive(", StringComparison.Ordinal);
+        Assert.True(helperIdx >= 0, "IsEventsFileActive helper must exist");
+
+        var helperBlock = source.Substring(helperIdx, Math.Min(1000, source.Length - helperIdx));
+        Assert.Contains("GetLastWriteTimeUtc", helperBlock);
+        Assert.Contains("PrematureIdleEventsFileFreshnessSeconds", helperBlock);
+    }
+
+    [Fact]
+    public void RecoverFromPrematureIdleIfNeededAsync_LoopsOnRepeatedPrematureIdle()
+    {
+        // Structural: recovery must loop to handle repeated premature idle (observed: 4x in a row).
+        // After each OnSessionComplete, it checks if events.jsonl is still active before deciding
+        // the worker is truly done.
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync method definition must exist");
+        var methodBlock = source.Substring(methodIdx, Math.Min(8000, source.Length - methodIdx));
+
+        // Must have a loop for repeated premature idle rounds
+        Assert.Contains("while (", methodBlock);
+        Assert.Contains("rounds++", methodBlock);
+        // Must check events.jsonl freshness inside the loop to decide if worker is truly done
+        Assert.Contains("IsEventsFileActive", methodBlock);
+    }
+
+    [Fact]
+    public void PrematureIdleEventsFileFreshnessSeconds_ConstantExists()
+    {
+        // The freshness threshold constant must exist and be reasonable (10-60s range)
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        Assert.Contains("PrematureIdleEventsFileFreshnessSeconds", source);
+
+        // Verify it's a constant (internal const int)
+        var constIdx = source.IndexOf("internal const int PrematureIdleEventsFileFreshnessSeconds", StringComparison.Ordinal);
+        Assert.True(constIdx >= 0, "Must be an internal const int");
+    }
+
+    #endregion
 }

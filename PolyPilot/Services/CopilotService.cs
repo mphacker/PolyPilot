@@ -56,6 +56,9 @@ public partial class CopilotService : IAsyncDisposable
     // Serializes the IsConnectionError reconnect path so concurrent workers
     // don't destroy each other's freshly-created client (thundering herd fix).
     private readonly SemaphoreSlim _clientReconnectLock = new(1, 1);
+    // Serializes per-session lazy/eager SDK reconnects so background restore and
+    // the first user send can't both resume the same placeholder concurrently.
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionConnectLocks = new();
     
     private static readonly object _pathLock = new();
     private static string? _copilotBaseDir;
@@ -475,10 +478,21 @@ public partial class CopilotService : IAsyncDisposable
         /// <summary>Timestamp (UTC ticks) when AssistantTurnEndEvent was received.
         /// Used by zero-idle capture to measure fallback wait duration.</summary>
         public long TurnEndReceivedAtTicks;
+        /// <summary>Signals when EVT-REARM fires (premature session.idle followed by
+        /// TurnStartEvent while IsProcessing=false). Used by ExecuteWorkerAsync to detect
+        /// that the initial TCS result was truncated and the worker is still running.
+        /// Reset in SendPromptAsync (new turn start).
+        /// Uses ManualResetEventSlim for event-based signaling (no polling).</summary>
+        public readonly ManualResetEventSlim PrematureIdleSignal = new ManualResetEventSlim(initialState: false);
         /// <summary>Set to true when this state is replaced by a reconnect. Prevents orphaned
         /// event handlers (still registered on the old CopilotSession) from processing events
         /// or clearing IsProcessing on the shared Info object.</summary>
         public volatile bool IsOrphaned;
+    }
+
+    private static void DisposePrematureIdleSignal(SessionState? state)
+    {
+        try { state?.PrematureIdleSignal?.Dispose(); } catch { }
     }
 
     private void Debug(string message)
@@ -780,28 +794,16 @@ public partial class CopilotService : IAsyncDisposable
         // Load organization state FIRST (groups, pinning, sorting) so reconcile during restore doesn't wipe it
         LoadOrganization();
 
-        // Restore previous sessions (includes subscribing to untracked server sessions in Persistent mode)
+        // Session restore runs in the background so the UI renders immediately.
+        // With many sessions (40+), sequential ResumeSessionAsync calls can take
+        // minutes — blocking here shows a blue screen until all are connected.
         IsRestoring = true;
         OnStateChanged?.Invoke();
-        await RestorePreviousSessionsAsync(cancellationToken);
-        IsRestoring = false;
-
-        // Flush session list immediately after restore so that any session IDs changed
-        // during fallback recreation (resume failed → CreateSessionAsync) are persisted.
-        // Without this, active-sessions.json retains stale IDs and LoadHistoryFromDisk
-        // reads the wrong events.jsonl on the next restart.
-        FlushSaveActiveSessionsToDisk();
-
-        // Start health check loop for any codespace groups (regardless of whether sessions were restored)
-        if (CodespacesEnabled)
-            StartCodespaceHealthCheck();
-
-        // Reconcile now that all sessions are restored
-        ReconcileOrganization();
-        OnStateChanged?.Invoke();
-
-        // Resume any pending orchestration dispatch that was interrupted by a relaunch
-        _ = ResumeOrchestrationIfPendingAsync(cancellationToken);
+        // CRITICAL: Must use Task.Run to ensure restore runs on ThreadPool, not UI SyncContext.
+        // Without Task.Run, the async continuations run on the UI thread. LoadHistoryFromDisk's
+        // .GetAwaiter().GetResult() then blocks the UI thread waiting for async file I/O whose
+        // continuation needs the UI thread → classic SyncContext deadlock → blue screen.
+        _ = Task.Run(() => RestoreSessionsInBackgroundAsync(cancellationToken));
 
         // Initialize any registered providers (from DI / plugin loader)
         await InitializeProvidersAsync(cancellationToken);
@@ -1894,14 +1896,20 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             IsCreating = true
         };
         // If a session with this name already exists, dispose it to avoid leaking the SDK session
-        if (_sessions.TryGetValue(name, out var existing) && existing.Session != null)
+        SessionState? replacedState = null;
+        if (_sessions.TryGetValue(name, out var existing))
         {
-            try { await existing.Session.DisposeAsync(); } catch { }
+            replacedState = existing;
+            if (existing.Session != null)
+            {
+                try { await existing.Session.DisposeAsync(); } catch { }
+            }
         }
 
         var state = new SessionState { Session = null!, Info = info };
         var previousActiveSessionName = _activeSessionName;
         _sessions[name] = state;
+        DisposePrematureIdleSignal(replacedState);
         _activeSessionName = name;
         if (!Organization.Sessions.Any(m => m.SessionName == name))
             AddSessionMeta(new SessionMeta { SessionName = name, GroupId = groupId ?? SessionGroup.DefaultId });
@@ -1914,7 +1922,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         }
         catch (OperationCanceledException)
         {
-            _sessions.TryRemove(name, out _);
+            if (_sessions.TryRemove(name, out var removedState))
+                DisposePrematureIdleSignal(removedState);
             RemoveSessionMetasWhere(m => m.SessionName == name);
             _activeSessionName = previousActiveSessionName;
             OnStateChanged?.Invoke();
@@ -1930,7 +1939,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Organization.Groups.Any(g => g.Id == groupId && g.IsCodespace);
             if (isCodespaceSession)
             {
-                _sessions.TryRemove(name, out _);
+                if (_sessions.TryRemove(name, out var removedState))
+                    DisposePrematureIdleSignal(removedState);
                 RemoveSessionMetasWhere(m => m.SessionName == name);
                 _activeSessionName = previousActiveSessionName;
                 OnStateChanged?.Invoke();
@@ -1951,7 +1961,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                         try { if (_client != null) await _client.DisposeAsync(); } catch { }
                         _client = null;
                         IsInitialized = false;
-                        _sessions.TryRemove(name, out _);
+                        if (_sessions.TryRemove(name, out var removedState))
+                            DisposePrematureIdleSignal(removedState);
                         RemoveSessionMetasWhere(m => m.SessionName == name);
                         _activeSessionName = previousActiveSessionName;
                         OnStateChanged?.Invoke();
@@ -1976,7 +1987,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 try { if (_client != null) await _client.DisposeAsync(); } catch { }
                 _client = null;
                 IsInitialized = false;
-                _sessions.TryRemove(name, out _);
+                if (_sessions.TryRemove(name, out var removedState))
+                    DisposePrematureIdleSignal(removedState);
                 RemoveSessionMetasWhere(m => m.SessionName == name);
                 _activeSessionName = previousActiveSessionName;
                 OnStateChanged?.Invoke();
@@ -1988,7 +2000,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 try { if (_client != null) await _client.DisposeAsync(); } catch { }
                 _client = null;
                 IsInitialized = false;
-                _sessions.TryRemove(name, out _);
+                if (_sessions.TryRemove(name, out var removedState))
+                    DisposePrematureIdleSignal(removedState);
                 RemoveSessionMetasWhere(m => m.SessionName == name);
                 _activeSessionName = previousActiveSessionName;
                 OnStateChanged?.Invoke();
@@ -2002,7 +2015,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             }
             catch (OperationCanceledException)
             {
-                _sessions.TryRemove(name, out _);
+                if (_sessions.TryRemove(name, out var removedState))
+                    DisposePrematureIdleSignal(removedState);
                 RemoveSessionMetasWhere(m => m.SessionName == name);
                 _activeSessionName = previousActiveSessionName;
                 OnStateChanged?.Invoke();
@@ -2013,7 +2027,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 try { if (_client != null) await _client.DisposeAsync(); } catch { }
                 _client = null;
                 IsInitialized = false;
-                _sessions.TryRemove(name, out _);
+                if (_sessions.TryRemove(name, out var removedState))
+                    DisposePrematureIdleSignal(removedState);
                 RemoveSessionMetasWhere(m => m.SessionName == name);
                 _activeSessionName = previousActiveSessionName;
                 OnStateChanged?.Invoke();
@@ -2023,7 +2038,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         catch
         {
             // SDK creation failed — remove the optimistic placeholder and restore prior state
-            _sessions.TryRemove(name, out _);
+            if (_sessions.TryRemove(name, out var removedState))
+                DisposePrematureIdleSignal(removedState);
             RemoveSessionMetasWhere(m => m.SessionName == name);
             _activeSessionName = previousActiveSessionName;
             OnStateChanged?.Invoke();
@@ -2379,6 +2395,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
             // Build replacement state, preserving info/history
             state.Info.Model = normalizedModel;
+            var oldState = state;
             var newState = new SessionState
             {
                 Session = newSession,
@@ -2386,6 +2403,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             };
             newSession.On(evt => HandleSessionEvent(newState, evt));
             _sessions[sessionName] = newState;
+            DisposePrematureIdleSignal(oldState);
 
             Debug($"Model switched for '{sessionName}' to {normalizedModel}");
             SaveActiveSessionsToDisk();
@@ -2452,7 +2470,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             throw new InvalidOperationException("Session is still being created. Please wait.");
 
         // Placeholder codespace sessions have Session=null until the tunnel connects
-        if (state.Session == null)
+        if (state.Session == null && IsCodespaceSession(sessionName))
             throw new InvalidOperationException("This session is waiting for its codespace to connect. Please wait for the green status dot.");
 
         if (state.Info.IsProcessing)
@@ -2462,6 +2480,22 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // IsProcessing=false and both enter without this guard.
         if (Interlocked.CompareExchange(ref state.SendingFlag, 1, 0) != 0)
             throw new InvalidOperationException("Session is already processing a request.");
+
+        // Lazy resume INSIDE the SendingFlag guard to prevent double-resume race:
+        // without this, two rapid sends could both see Session==null and both call
+        // EnsureSessionConnectedAsync concurrently, leaking the first resumed session.
+        if (state.Session == null)
+        {
+            try
+            {
+                await EnsureSessionConnectedAsync(sessionName, state, cancellationToken);
+            }
+            catch
+            {
+                Interlocked.Exchange(ref state.SendingFlag, 0);
+                throw;
+            }
+        }
 
         long myGeneration = 0; // will be set right after the generation increment inside try
 
@@ -2479,6 +2513,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.Info.ClearPermissionDenials();
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0); // Reset stale tool count from previous turn
         state.HasUsedToolsThisTurn = false; // Reset stale tool flag from previous turn
+        state.PrematureIdleSignal.Reset(); // Clear premature idle detection from previous turn
         state.FallbackCanceledByTurnStart = false;
         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
         Interlocked.Exchange(ref state.EventCountThisTurn, 0); // Reset event counter for zero-idle capture
@@ -2738,8 +2773,10 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                                     Debug($"[RECONNECT] Sibling '{kvp.Key}' already replaced by another reconnect — discarding");
                                                     siblingState.IsOrphaned = true;
                                                     try { await resumed.DisposeAsync(); } catch { }
+                                                    DisposePrematureIdleSignal(otherState);
                                                     continue;
                                                 }
+                                                DisposePrematureIdleSignal(otherState);
                                                 Debug($"[RECONNECT] Re-resumed sibling session '{kvp.Key}' after client recreation");
                                             }
                                             catch (Exception reEx)
@@ -2876,6 +2913,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // FlushedResponse contains text from earlier FlushCurrentResponse calls —
                     // this is real output the worker produced before the connection died.
                     var preservedFlushed = state.FlushedResponse.ToString();
+                    var oldState = state;
                     var newState = new SessionState
                     {
                         Session = newSession,
@@ -2897,6 +2935,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     newState.IsMultiAgentSession = state.IsMultiAgentSession;
                     newSession.On(evt => HandleSessionEvent(newState, evt));
                     _sessions[sessionName] = newState;
+                    DisposePrematureIdleSignal(oldState);
                     state = newState;
 
                     // Increment generation AFTER registering the event handler so that any
@@ -3707,6 +3746,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         CancelProcessingWatchdog(state);
         CancelTurnEndFallback(state);
         CancelToolHealthCheck(state);
+        DisposePrematureIdleSignal(state);
 
         // Dispose the SDK session AFTER UI has updated — DisposeAsync talks to the CLI
         // process and may trigger additional SDK events on background threads. Running it
