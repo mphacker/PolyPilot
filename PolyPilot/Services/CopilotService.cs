@@ -2332,6 +2332,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             // Use existing worktree
             wt = _repoManager.Worktrees.FirstOrDefault(w => w.Id == worktreeId)
                 ?? throw new InvalidOperationException($"Worktree '{worktreeId}' not found.");
+            // Stamp last-used now; CreateWorktreeAsync/CreateWorktreeFromPrAsync stamp it for new worktrees
+            _repoManager.TouchRepository(wt.RepoId);
         }
         else if (prNumber.HasValue)
         {
