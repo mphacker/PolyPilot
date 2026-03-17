@@ -1238,9 +1238,29 @@
     private void HandleOrchestratorPhaseChanged(string groupId, OrchestratorPhase phase, string? detail)
     {
         if (phase == OrchestratorPhase.Complete)
-            _groupPhases.Remove(groupId);
-        else
+        {
+            // Show "✅ Complete" briefly so user sees orchestration finished, then auto-dismiss
             _groupPhases[groupId] = (phase, detail);
+            ScheduleRender();
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(8000);
+                await InvokeAsync(() =>
+                {
+                    if (_disposed) return;
+                    // Only remove if still showing Complete — a new orchestration may have
+                    // started for this group, overwriting Complete with Planning/Dispatching
+                    if (_groupPhases.TryGetValue(groupId, out var current) &&
+                        current.Phase == OrchestratorPhase.Complete)
+                    {
+                        _groupPhases.Remove(groupId);
+                        ScheduleRender();
+                    }
+                });
+            });
+            return;
+        }
+        _groupPhases[groupId] = (phase, detail);
         ScheduleRender();
     }
 
@@ -1250,6 +1270,7 @@
         OrchestratorPhase.Dispatching => "📡 Dispatching..." + (detail != null ? $" {detail}" : ""),
         OrchestratorPhase.WaitingForWorkers => "⏳ Waiting for workers...",
         OrchestratorPhase.Synthesizing => "🔄 Synthesizing...",
+        OrchestratorPhase.Complete => "✅ Complete" + (detail != null ? $" — {detail.Split('\n')[0]}" : ""),
         _ => ""
     };
 

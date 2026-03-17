@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.DependencyInjection;
 using PolyPilot.Models;
 
 namespace PolyPilot.Services;
@@ -1176,6 +1177,24 @@ public partial class CopilotService
         {
             ClearPendingOrchestration();
             InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Complete, null));
+            var spGroupName = group?.Name ?? groupId;
+            var spOrchSessionId = _sessions.TryGetValue(orchestratorName!, out var spOrchState)
+                ? spOrchState.Info.SessionId : null;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var currentSettings = ConnectionSettings.Load();
+                    if (!currentSettings.EnableSessionNotifications) return;
+                    var notifService = _serviceProvider?.GetService<INotificationManagerService>();
+                    if (notifService == null || !notifService.HasPermission) return;
+                    await notifService.SendNotificationAsync(
+                        $"✅ {spGroupName}",
+                        "Orchestration complete",
+                        spOrchSessionId);
+                }
+                catch { }
+            });
         }
     }
 
@@ -3131,10 +3150,35 @@ public partial class CopilotService
             }
 
             SaveOrganization();
+            var completionSummary = reflectState.BuildCompletionSummary();
             InvokeOnUI(() =>
             {
-                OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Complete, reflectState.BuildCompletionSummary());
+                OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Complete, completionSummary);
                 OnStateChanged?.Invoke();
+            });
+
+            // Send OS notification so the user knows orchestration finished
+            var groupName = group?.Name ?? groupId;
+            var goalMet = reflectState.GoalMet;
+            var iterationCount = reflectState.CurrentIteration;
+            var orchSessionId = _sessions.TryGetValue(orchestratorName!, out var orchState)
+                ? orchState.Info.SessionId : null;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var currentSettings = ConnectionSettings.Load();
+                    if (!currentSettings.EnableSessionNotifications) return;
+                    var notifService = _serviceProvider?.GetService<INotificationManagerService>();
+                    if (notifService == null || !notifService.HasPermission) return;
+                    var emoji = goalMet ? "✅" : "⚠️";
+                    await notifService.SendNotificationAsync(
+                        $"{emoji} {groupName}",
+                        $"Orchestration complete — {(goalMet ? "goal met" : "finished")} " +
+                        $"({iterationCount} iteration{(iterationCount != 1 ? "s" : "")})",
+                        orchSessionId);
+                }
+                catch { }
             });
         }
 
