@@ -1,6 +1,49 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace PolyPilot.Models;
+
+/// <summary>
+/// Tolerant JSON converter for enums that falls back to default(T) for unknown values
+/// instead of throwing. This ensures backward compatibility when the desktop adds new
+/// enum members that older mobile clients don't know about yet.
+/// </summary>
+public class TolerantEnumConverter<T> : JsonConverter<T> where T : struct, Enum
+{
+    public override T Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.String)
+        {
+            if (Enum.TryParse<T>(reader.GetString(), ignoreCase: true, out var result))
+                return result;
+            return default;
+        }
+        if (reader.TokenType == JsonTokenType.Number)
+        {
+            var intVal = reader.GetInt32();
+            if (Enum.IsDefined(typeof(T), intVal))
+                return (T)(object)intVal;
+            return default;
+        }
+        reader.Skip();
+        return default;
+    }
+
+    public override void Write(Utf8JsonWriter writer, T value, JsonSerializerOptions options)
+        => writer.WriteStringValue(value.ToString());
+}
+
+/// <summary>Controls whether a session appears in the Focus strip.</summary>
+[JsonConverter(typeof(TolerantEnumConverter<FocusOverride>))]
+public enum FocusOverride
+{
+    /// <summary>Determined automatically by recency (last 24h activity).</summary>
+    Auto,
+    /// <summary>Manually added to Focus regardless of activity time.</summary>
+    Included,
+    /// <summary>Manually dismissed from Focus regardless of activity time.</summary>
+    Excluded
+}
 
 public class SessionGroup
 {
@@ -143,11 +186,18 @@ public class SessionMeta
     public string GroupId { get; set; } = SessionGroup.DefaultId;
     public bool IsPinned { get; set; }
     public int ManualOrder { get; set; }
+    /// <summary>Focus strip override. Auto = determined by 24h recency.</summary>
+    public FocusOverride FocusOverride { get; set; } = FocusOverride.Auto;
+    /// <summary>
+    /// When the user marks this session as "Handled" in the Focus strip.
+    /// Handled sessions sort to the bottom of the Focus list until new activity clears this.
+    /// </summary>
+    public DateTime? HandledAt { get; set; }
     /// <summary>Worktree ID if this session was created from a worktree.</summary>
     public string? WorktreeId { get; set; }
 
     /// <summary>Role of this session within a multi-agent group.</summary>
-    public MultiAgentRole Role { get; set; } = MultiAgentRole.Worker;
+    public MultiAgentRole Role { get; set; } = MultiAgentRole.None;
 
     /// <summary>
     /// Preferred model for this session in multi-agent context.
@@ -164,7 +214,7 @@ public class SessionMeta
     public string? SystemPrompt { get; set; }
 }
 
-[JsonConverter(typeof(JsonStringEnumConverter))]
+[JsonConverter(typeof(TolerantEnumConverter<SessionSortMode>))]
 public enum SessionSortMode
 {
     LastActive,
@@ -174,7 +224,7 @@ public enum SessionSortMode
 }
 
 /// <summary>How prompts are distributed in a multi-agent group.</summary>
-[JsonConverter(typeof(JsonStringEnumConverter))]
+[JsonConverter(typeof(TolerantEnumConverter<MultiAgentMode>))]
 public enum MultiAgentMode
 {
     /// <summary>Send the same prompt to all sessions simultaneously.</summary>
@@ -188,7 +238,7 @@ public enum MultiAgentMode
 }
 
 /// <summary>How worktrees are allocated across sessions in a multi-agent group.</summary>
-[JsonConverter(typeof(JsonStringEnumConverter))]
+[JsonConverter(typeof(TolerantEnumConverter<WorktreeStrategy>))]
 public enum WorktreeStrategy
 {
     /// <summary>All sessions share one worktree (current default behavior).</summary>
@@ -202,9 +252,11 @@ public enum WorktreeStrategy
 }
 
 /// <summary>Role of a session within a multi-agent group.</summary>
-[JsonConverter(typeof(JsonStringEnumConverter))]
+[JsonConverter(typeof(TolerantEnumConverter<MultiAgentRole>))]
 public enum MultiAgentRole
 {
+    /// <summary>No multi-agent role — regular standalone session.</summary>
+    None,
     /// <summary>Regular worker session that receives prompts.</summary>
     Worker,
     /// <summary>Orchestrator session that delegates work (used in Orchestrator mode).</summary>

@@ -574,8 +574,20 @@ public partial class CopilotService : IAsyncDisposable
         {
             while (!ct.IsCancellationRequested)
             {
+                var beforeDelay = DateTime.UtcNow;
                 await Task.Delay(TimeSpan.FromSeconds(KeepalivePingIntervalSeconds), ct);
                 if (ct.IsCancellationRequested) break;
+
+                // If the actual elapsed time is significantly longer than the intended delay,
+                // the process was suspended (e.g. Mac lock screen or sleep). The headless
+                // server may have shut down during the gap — trigger a health check.
+                var elapsed = DateTime.UtcNow - beforeDelay;
+                if (elapsed.TotalSeconds > KeepalivePingIntervalSeconds * 1.5)
+                {
+                    Debug($"[KEEPALIVE] Process was suspended for {elapsed.TotalSeconds:F0}s — triggering connection health check");
+                    _ = Task.Run(() => CheckConnectionHealthAsync(ct), ct);
+                    continue; // CheckConnectionHealthAsync will send a ping if healthy
+                }
 
                 var client = _client;
                 if (client == null || IsDemoMode || IsRemoteMode) continue;
@@ -594,6 +606,32 @@ public partial class CopilotService : IAsyncDisposable
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { Debug($"[KEEPALIVE] Loop exited: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Lightweight connection health check. Sends a ping to the headless server; if it fails
+    /// (e.g. after the Mac was locked and the server shut down), triggers persistent server
+    /// recovery. Safe to call from <c>App.OnResume()</c> or after detecting a long sleep gap.
+    /// No-op in Demo or Remote mode.
+    /// </summary>
+    public async Task CheckConnectionHealthAsync(CancellationToken ct = default)
+    {
+        if (IsDemoMode || IsRemoteMode) return;
+        var client = _client;
+        if (client == null) return;
+
+        try
+        {
+            await client.PingAsync("health-check", ct);
+            Debug("[HEALTH] Connection healthy after resume/wake");
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Debug($"[HEALTH] Ping failed after resume/wake ({ex.Message}) — attempting persistent server recovery");
+            if (CurrentMode == ConnectionMode.Persistent)
+                _ = Task.Run(() => TryRecoverPersistentServerAsync(), CancellationToken.None);
+        }
     }
 
     private void Debug(string message)
@@ -2887,6 +2925,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // (0 != actual_generation) to incorrectly skip the SendingFlag release → session deadlock.
         myGeneration = Interlocked.Increment(ref state.ProcessingGeneration);
         state.Info.IsProcessing = true;
+        state.Info.LastUpdatedAt = DateTime.Now;
         state.Info.ProcessingStartedAt = DateTime.UtcNow;
         state.Info.ToolCallCount = 0;
         state.Info.ProcessingPhase = 0; // Sending
@@ -4228,9 +4267,10 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             OnStateChanged?.Invoke();
             return;
         }
-        if (_sessions.ContainsKey(name))
+        if (_sessions.TryGetValue(name, out var activeState))
         {
             _activeSessionName = name;
+            activeState.Info.LastUpdatedAt = DateTime.Now;
             if (IsRemoteMode)
                 _ = _bridgeClient.SwitchSessionAsync(name);
         }
@@ -4547,6 +4587,8 @@ public class UiState
     public string? ExpandedSession { get; set; }
     public Dictionary<string, string> InputModes { get; set; } = new();
     public HashSet<string> CompletedTutorials { get; set; } = new();
+    public int GridColumns { get; set; } = 3;
+    public int CardMinHeight { get; set; } = 250;
 }
 
 public class ActiveSessionEntry
@@ -4565,6 +4607,7 @@ public class ActiveSessionEntry
     public int PremiumRequestsUsed { get; set; }
     public double TotalApiTimeSeconds { get; set; }
     public DateTime? CreatedAt { get; set; }
+    public DateTime? LastUpdatedAt { get; set; }
 }
 
 public class PersistedSessionInfo

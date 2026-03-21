@@ -8,7 +8,7 @@
     var displayName = providerDisplayName ?? Session.Name;
 }
 
-<div class="session-card @(Session.IsProcessing ? "processing" : IsCompleted ? "completed" : Session.NeedsAttention ? "needs-attention" : "idle") @(Meta?.IsPinned == true ? "pinned" : "")" data-session="@Session.Name">
+<div class="session-card @(Session.IsProcessing ? "processing" : IsCompleted ? "completed" : Session.NeedsAttention ? "needs-attention" : "idle") @(Meta?.IsPinned == true ? "pinned" : "") @(IsInFocusStrip ? "in-focus-strip" : "")" data-session="@Session.Name" style="@(MinHeight > 0 ? $"min-height:{MinHeight}px" : "")">
     <div class="card-header">
         <div class="card-title" @onclick="GoToSession" style="cursor:pointer">
             @if (Meta?.IsPinned == true)
@@ -55,6 +55,19 @@
                     </button>
                 }
                 <div class="card-menu-separator"></div>
+                @if (Meta?.FocusOverride == FocusOverride.Excluded)
+                {
+                    <button class="card-menu-item" @onclick="() => { OnCloseMenu.InvokeAsync(); CopilotService.SetFocusOverride(Session.Name, FocusOverride.Auto); }">
+                        🎯 Re-enable auto-focus
+                    </button>
+                }
+                else if (!IsInFocusStrip)
+                {
+                    <button class="card-menu-item" @onclick="() => { OnCloseMenu.InvokeAsync(); CopilotService.SetFocusOverride(Session.Name, FocusOverride.Included); }">
+                        🎯 Add to Focus
+                    </button>
+                }
+                <div class="card-menu-separator"></div>
                 <button class="card-menu-item destructive" @onclick="async () => { await OnCloseMenu.InvokeAsync(); _ = CopilotService.CloseSessionAsync(Session.Name); }">
                     ✕ Close Session
                 </button>
@@ -64,6 +77,10 @@
         @if (Session.IsProcessing)
         {
             <button class="card-stop" @onclick="() => CopilotService.AbortSessionAsync(Session.Name)" title="Stop">■</button>
+        }
+        @if (IsInFocusStrip)
+        {
+            <button class="card-handled-focus" @onclick="() => OnHandledInFocus.InvokeAsync()" title="Mark as handled — moves to bottom of Focus list">✓</button>
         }
         <button class="card-expand" @onclick="ExpandSession" title="Expand">⤢</button>
     </div>
@@ -111,6 +128,10 @@
                          Layout="@Layout"
                          Style="@Style"
                          RepoUrl="@RepoUrl" />
+        @if (!Session.IsProcessing && string.IsNullOrEmpty(Intent) && cardMsgs.Count == 0 && !string.IsNullOrEmpty(Session.LastUserPrompt))
+        {
+            <div class="card-last-prompt" title="Last prompt sent to this session">💬 @(Session.LastUserPrompt.Length > 80 ? Session.LastUserPrompt[..77] + "…" : Session.LastUserPrompt)</div>
+        }
     </div>
 
     @if (!string.IsNullOrEmpty(Error))
@@ -132,6 +153,29 @@
     @if (!string.IsNullOrEmpty(Intent))
     {
         <div class="intent-pill compact">💭 @Intent</div>
+    }
+
+    @if (Session.ReflectionCycle is { IsActive: true, IsPaused: false } rc)
+    {
+        var progress = rc.MaxIterations > 0 ? (double)rc.CurrentIteration / rc.MaxIterations * 100 : 0;
+        var truncGoal = rc.Goal.Length > 30 ? rc.Goal[..27] + "…" : rc.Goal;
+        <div class="card-reflection-pill">
+            <span class="card-reflection-progress" style="width: @progress.ToString("F0")%"></span>
+            <span class="card-reflection-text">🔄 @rc.CurrentIteration/@rc.MaxIterations · @truncGoal</span>
+            <button class="card-reflection-stop" @onclick="() => CopilotService.StopReflectionCycle(Session.Name)" @onclick:stopPropagation="true" title="Stop reflection cycle">■</button>
+        </div>
+    }
+    else if (Session.ReflectionCycle is { IsPaused: true } rp)
+    {
+        var truncGoal = rp.Goal.Length > 30 ? rp.Goal[..27] + "…" : rp.Goal;
+        <div class="card-reflection-pill paused">
+            <span class="card-reflection-text">⏸️ @rp.CurrentIteration/@rp.MaxIterations · @truncGoal</span>
+        </div>
+    }
+
+    @if (Session.ConsecutiveStuckCount >= 1 && !Session.IsProcessing)
+    {
+        <div class="card-stuck-banner">⚠ Stuck · @Session.ConsecutiveStuckCount consecutive failures</div>
     }
 
     @if (PendingImages.Any())
@@ -195,6 +239,14 @@
     [Parameter] public EventCallback OnClearQueue { get; set; }
     [Parameter] public EventCallback<int> OnRemovePendingImage { get; set; }
     [Parameter] public EventCallback<string> OnSend { get; set; } // message text
+    /// <summary>When set, shows a checkmark "Handled" button that marks this session as handled in the Focus strip.</summary>
+    [Parameter] public EventCallback OnHandledInFocus { get; set; }
+    /// <summary>Kept for backward compatibility — use OnHandledInFocus instead.</summary>
+    [Parameter] public EventCallback OnDismissFromFocus { get; set; }
+    /// <summary>When true, the card is rendered in the Focus strip (slightly more messages, distinct styling).</summary>
+    [Parameter] public bool IsInFocusStrip { get; set; }
+    /// <summary>Minimum height in px for the card. 0 = use CSS default.</summary>
+    [Parameter] public int MinHeight { get; set; } = 0;
     private async Task HandleRenameKeyUp(KeyboardEventArgs e)
     {
         if (e.Key == "Enter")

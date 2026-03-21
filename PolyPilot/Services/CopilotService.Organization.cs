@@ -207,8 +207,7 @@ public partial class CopilotService
                 // Only promote if there are matching worker sessions with the same team prefix
                 var teamPrefix = orchestratorPattern.Replace(meta.SessionName, "");
                 bool hasMatchingWorkers = Organization.Sessions.Any(m =>
-                    m.SessionName.StartsWith(teamPrefix + "-", StringComparison.OrdinalIgnoreCase)
-                    && workerPattern.IsMatch(m.SessionName));
+                    IsWorkerForTeamPrefix(m.SessionName, teamPrefix, workerPattern));
                 if (!hasMatchingWorkers) continue;
 
                 Debug($"LoadOrganization: healing role for '{meta.SessionName}' — name matches orchestrator pattern, Role was {meta.Role}");
@@ -293,8 +292,7 @@ public partial class CopilotService
                 .Select(g => g.Id)
                 .ToHashSet();
             var teamWorkers = Organization.Sessions
-                .Where(m => m.SessionName.StartsWith(teamPrefix + "-", StringComparison.OrdinalIgnoreCase)
-                            && workerPattern.IsMatch(m.SessionName)
+                .Where(m => IsWorkerForTeamPrefix(m.SessionName, teamPrefix, workerPattern)
                             && m.SessionName != orchMeta.SessionName
                             && nonMultiAgentGroupIds.Contains(m.GroupId))
                 .ToList();
@@ -353,6 +351,22 @@ public partial class CopilotService
                 workerMeta.Role = MultiAgentRole.Worker;
             }
             healed = true;
+        }
+
+        // Phase 4: Clear stale Worker/Orchestrator roles from non-multi-agent groups.
+        // Sessions can get mislabeled (e.g., moved from a multi-agent group to a regular
+        // group but their Role wasn't reset). A Worker role in a non-multi-agent group
+        // causes the session to be hidden from Focus and other UI surfaces.
+        var groupLookup = Organization.Groups.ToDictionary(g => g.Id);
+        foreach (var meta in Organization.Sessions)
+        {
+            if (meta.Role == MultiAgentRole.None) continue;
+            if (!groupLookup.TryGetValue(meta.GroupId, out var grp) || !grp.IsMultiAgent)
+            {
+                Debug($"LoadOrganization: clearing stale Role={meta.Role} from '{meta.SessionName}' (group '{grp?.Name ?? meta.GroupId}' is not multi-agent)");
+                meta.Role = MultiAgentRole.None;
+                healed = true;
+            }
         }
 
         } // end lock
@@ -702,6 +716,99 @@ public partial class CopilotService
         }
     }
 
+    /// <summary>
+    /// Sets whether a session is manually included or excluded from the Focus strip.
+    /// Pass Auto to revert to recency-based detection.
+    /// </summary>
+    public void SetFocusOverride(string sessionName, FocusOverride focusOverride)
+    {
+        SessionMeta? meta;
+        lock (_organizationLock)
+            meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == sessionName);
+        if (meta != null)
+        {
+            meta.FocusOverride = focusOverride;
+            SaveOrganization();
+            OnStateChanged?.Invoke();
+        }
+    }
+
+    /// <summary>
+    /// Returns sessions that should appear in the Focus strip:
+    /// - Sessions with FocusOverride.Included always appear.
+    /// - Sessions currently processing appear (unless FocusOverride.Excluded).
+    /// - Sessions with unread messages appear (unless FocusOverride.Excluded).
+    /// - Sort order (triage-first):
+    ///   1. Processing sessions (active work)
+    ///   2. NeedsAttention (awaiting user) — oldest first (longest waiting at top)
+    ///   3. Handled sessions (sorted to bottom, most recently handled last)
+    /// </summary>
+    public IReadOnlyList<AgentSessionInfo> GetFocusSessions()
+    {
+        var metas = SnapshotSessionMetas().ToDictionary(m => m.SessionName);
+        var recentCutoff = DateTime.Now.AddHours(-24);
+
+        var groups = SnapshotGroups().ToDictionary(g => g.Id);
+
+        return GetAllSessions()
+            .Where(s =>
+            {
+                var hasMeta = metas.TryGetValue(s.Name, out var meta);
+                // Check explicit override first (takes priority over everything)
+                if (hasMeta && meta!.FocusOverride == FocusOverride.Included) return true;
+                if (hasMeta && meta!.FocusOverride == FocusOverride.Excluded) return false;
+                // Workers never appear in the Focus strip — they run under their orchestrator.
+                // This covers both workers in proper multi-agent groups AND workers whose group
+                // was lost but Role=Worker wasn't yet cleared by the healer.
+                if (hasMeta && meta!.Role == MultiAgentRole.Worker)
+                    return false;
+                // Active = processing, has unread messages, or had real activity in last 24h
+                return s.IsProcessing || s.UnreadCount > 0 || s.LastUpdatedAt > recentCutoff;
+            })
+            .OrderBy(s =>
+            {
+                var hasMeta = metas.TryGetValue(s.Name, out var meta);
+                var handledAt = hasMeta ? meta!.HandledAt : null;
+                // Tier 0: Processing (active work) — always at top regardless of Handled
+                if (s.IsProcessing) return 0;
+                // Tier 1: Unhandled, needs attention or unread — oldest first (longest waiting)
+                if (handledAt == null) return 1;
+                // Tier 2: Handled — sorted to bottom
+                return 2;
+            })
+            .ThenBy(s =>
+            {
+                var hasMeta = metas.TryGetValue(s.Name, out var meta);
+                var handledAt = hasMeta ? meta!.HandledAt : null;
+                if (s.IsProcessing) return DateTime.MaxValue.Ticks - s.LastUpdatedAt.Ticks; // Processing: most recent first (descending via inversion)
+                if (handledAt == null) return s.LastUpdatedAt.Ticks; // Unhandled: oldest first (ascending = longest wait at top)
+                return handledAt.Value.Ticks; // Handled: most recently handled at bottom (ascending)
+            })
+            .ToList();
+    }
+
+    /// <summary>
+    /// Marks a session as "handled" in the Focus strip — moves it to the bottom of the list.
+    /// Cleared automatically when the session gets new activity.
+    /// </summary>
+    public void MarkFocusHandled(string sessionName)
+    {
+        SessionMeta? meta;
+        lock (_organizationLock)
+        {
+            meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == sessionName);
+            if (meta != null)
+            {
+                meta.HandledAt = DateTime.Now;
+            }
+        }
+        if (meta != null)
+        {
+            SaveOrganization();
+            OnStateChanged?.Invoke();
+        }
+    }
+
     public void MoveSession(string sessionName, string groupId)
     {
         if (!Organization.Groups.Any(g => g.Id == groupId))
@@ -957,6 +1064,44 @@ public partial class CopilotService
         _organizedSessionsCache = result;
         _organizedSessionsCacheKey = key;
         return result;
+    }
+
+    /// <summary>
+    /// Returns true if <paramref name="sessionName"/> is a worker session that belongs to
+    /// the team identified by <paramref name="orchTeamPrefix"/> (the orchestrator's name
+    /// with the trailing "-orchestrator" suffix removed).
+    ///
+    /// Two matching strategies are tried in order:
+    /// 1. Exact prefix: worker name starts with "{orchTeamPrefix}-"
+    /// 2. Namespace-prefix fallback: the orchestrator prefix is a scoped version of the
+    ///    worker's prefix, where the scope is a short "XX- " (dash-space) prefix, e.g.:
+    ///      orchestrator: "PP- PR Review Squad-orchestrator" → prefix "PP- PR Review Squad"
+    ///      workers:      "PR Review Squad-worker-1"         → prefix "PR Review Squad"
+    ///    The namespace "PP- " ends with "- " → this IS a scoped prefix → match.
+    ///    This prevents false matches like "Review Squad" picking up "Squad-worker-1",
+    ///    because "Review " does not end with "- " and is therefore not a namespace prefix.
+    /// </summary>
+    private static bool IsWorkerForTeamPrefix(string sessionName, string orchTeamPrefix, Regex workerPattern)
+    {
+        if (!workerPattern.IsMatch(sessionName)) return false;
+
+        // Strategy 1: exact prefix match
+        if (sessionName.StartsWith(orchTeamPrefix + "-", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Strategy 2: worker's prefix is a suffix of the orchestrator's prefix, and the
+        // difference (the "namespace") ends with "- " (dash-space) — PolyPilot convention
+        // for squad namespacing (e.g. "PP- ", "WQ- "). This prevents "Review Squad" from
+        // incorrectly claiming "Squad-worker-1" via a bare EndsWith check.
+        var workerPrefix = workerPattern.Replace(sessionName, "");
+        if (workerPrefix.Length > 0 && orchTeamPrefix.Length > workerPrefix.Length
+            && orchTeamPrefix.EndsWith(workerPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            var namespacePrefix = orchTeamPrefix[..^workerPrefix.Length];
+            return namespacePrefix.EndsWith("- ", StringComparison.Ordinal);
+        }
+
+        return false;
     }
 
     private static int UrgencyScore(AgentSessionInfo session) =>
@@ -1375,7 +1520,7 @@ public partial class CopilotService
     private string BuildMultiAgentPrefix(string sessionName, SessionGroup group, List<string> allMembers)
     {
         var meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == sessionName);
-        var role = meta?.Role ?? MultiAgentRole.Worker;
+        var role = meta?.Role ?? MultiAgentRole.None;
         var roleName = role == MultiAgentRole.Orchestrator ? "orchestrator" : "worker";
         var memberDetails = allMembers.Where(m => m != sessionName)
             .Select(m => $"'{m}' ({GetEffectiveModel(m)})")
@@ -3835,7 +3980,7 @@ public partial class CopilotService
             .Select(name =>
             {
                 var meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == name);
-                return (name, GetEffectiveModel(name), meta?.Role ?? MultiAgentRole.Worker);
+                return (name, GetEffectiveModel(name), meta?.Role ?? MultiAgentRole.None);
             })
             .ToList();
 

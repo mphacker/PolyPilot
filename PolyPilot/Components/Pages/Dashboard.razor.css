@@ -9,7 +9,85 @@
     overflow-x: hidden;
     max-width: 100%;
     box-sizing: border-box;
+    position: relative;
 }
+
+/* Focus strip */
+.focus-strip-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+    margin-top: 0.25rem;
+}
+
+.focus-strip-label {
+    font-size: var(--type-body);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.focus-strip-count {
+    font-size: var(--type-caption1);
+    background: rgba(99, 102, 241, 0.15);
+    color: rgba(99, 102, 241, 0.9);
+    border-radius: 10px;
+    padding: 0 0.4rem;
+    min-width: 1.4rem;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
+
+.focus-strip-hint {
+    font-size: var(--type-caption1);
+    color: var(--text-dim);
+    font-style: italic;
+}
+
+.focus-strip {
+    display: grid;
+    gap: 1rem;
+    padding-bottom: 1rem;
+    margin-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border-subtle, rgba(128,128,128,0.15));
+    background: var(--bg-primary, #1a1a2e);
+}
+
+::deep .focus-strip .session-card {
+    min-height: var(--card-min-height, 250px);
+    max-height: 45vh;
+    overflow-y: auto;
+    scrollbar-width: thin;
+}
+
+/* Apply card min-height to regular grid cards too */
+::deep .session-grid .session-card {
+    min-height: var(--card-min-height, 250px);
+}
+
+::deep .focus-strip .session-card.in-focus-strip {
+    border-color: rgba(99, 102, 241, 0.2);
+    background: var(--bg-secondary);
+}
+
+/* Dismiss button on focus cards */
+::deep .card-dismiss-focus {
+    all: unset;
+    font-size: var(--type-caption1);
+    color: var(--text-dim);
+    cursor: pointer;
+    padding: 0.15rem 0.3rem;
+    border-radius: 4px;
+    opacity: 0.6;
+    flex-shrink: 0;
+    transition: opacity 0.15s, color 0.15s;
+}
+::deep .card-dismiss-focus:hover {
+    opacity: 1;
+    color: #ef4444;
+}
+
+
 
 .dashboard.expanded-mode {
     padding: 0;
@@ -257,13 +335,9 @@
 
 .session-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr));
+    grid-template-columns: repeat(3, 1fr); /* overridden by inline style from _gridColumns */
     gap: 1rem;
     margin-bottom: 1.5rem;
-}
-
-.session-grid.expanded-grid {
-    grid-template-columns: repeat(auto-fill, minmax(min(600px, 100%), 1fr));
 }
 
 .toolbar-actions {
@@ -325,6 +399,43 @@
 
 .dashboard-header .font-size-label {
     font-size: var(--type-caption1);
+}
+
+/* Grid column count control */
+.grid-columns-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.15rem;
+}
+
+.grid-col-btn {
+    background: var(--hover-bg);
+    border: 1px solid var(--hover-bg);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: var(--type-footnote);
+    font-weight: 600;
+    padding: 0.1rem 0.4rem;
+    line-height: 1;
+}
+
+.grid-col-btn:hover:not(:disabled) {
+    background: var(--hover-bg);
+    color: var(--text-bright);
+}
+
+.grid-col-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+}
+
+.grid-col-label {
+    font-size: var(--type-caption1);
+    color: var(--text-secondary);
+    min-width: 3.5ch;
+    text-align: center;
+    cursor: default;
 }
 
 /* Sort select in dashboard header */

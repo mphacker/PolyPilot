@@ -13,7 +13,7 @@
 @inject FiestaService FiestaService
 @implements IAsyncDisposable
 
-<div class="dashboard @(expandedSession != null ? "expanded-mode" : "")">
+<div class="dashboard @(expandedSession != null ? "expanded-mode" : "")" style="--card-min-height: @(_cardMinHeight)px">
     @if (!sessions.Any())
     {
         <div class="no-sessions-dash">
@@ -213,9 +213,16 @@
                         <button class="grid-density-btn" @onclick="() => { isAddingDashGroup = true; }" title="New group">+ Group</button>
                         <button class="grid-density-btn multi-agent-btn" @onclick="() => { isAddingMultiAgentGroup = true; }" title="New multi-agent group">🤖 + Multi-Agent</button>
                     }
-                    <button class="grid-density-btn" @onclick="ToggleGridDensity" title="@(isCompactGrid ? "Expanded grid" : "Compact grid")">
-                        @(isCompactGrid ? "▤ Expanded" : "▦ Compact")
-                    </button>
+                    <span class="grid-columns-control">
+                        <button class="grid-col-btn" @onclick="DecrementGridColumns" disabled="@(_gridColumns <= 2)" title="Fewer columns">−</button>
+                        <span class="grid-col-label" title="Cards per row">@_gridColumns col</span>
+                        <button class="grid-col-btn" @onclick="IncrementGridColumns" disabled="@(_gridColumns >= 6)" title="More columns">+</button>
+                    </span>
+                    <span class="grid-columns-control">
+                        <button class="grid-col-btn" @onclick="DecrementCardHeight" disabled="@(_cardMinHeight <= 150)" title="Shorter cards">−</button>
+                        <span class="grid-col-label" title="Card min height">↕ @(_cardMinHeight)px</span>
+                        <button class="grid-col-btn" @onclick="IncrementCardHeight" disabled="@(_cardMinHeight >= 600)" title="Taller cards">+</button>
+                    </span>
                     <span class="font-size-controls">
                         <button class="font-size-btn" @onclick="DecreaseFontSize" disabled="@(fontSize <= 12)" title="Decrease font size (⌘−)">A−</button>
                         <span class="font-size-label" @onclick="ResetFontSize" title="Reset font size (⌘0)">@(fontSize)px</span>
@@ -230,6 +237,60 @@
                 </div>
             </div>
         </div>
+
+        @if (expandedSession == null)
+        {
+            var focusSessions = CopilotService.GetFocusSessions();
+            @if (focusSessions.Count > 0)
+            {
+            <div class="focus-strip-header">
+                <span class="focus-strip-label">🎯 Focus</span>
+                <span class="focus-strip-count">@focusSessions.Count</span>
+                <span class="focus-strip-hint">Recently active</span>
+            </div>
+            <div class="focus-strip" style="grid-template-columns: repeat(@_gridColumns, 1fr)">
+                @foreach (var session in focusSessions)
+                {
+                    var isCompleted = completedSessions.Contains(session.Name);
+                    var meta = CopilotService.GetSessionMeta(session.Name);
+                    var focusKey = "focus:" + session.Name;
+                    <SessionCard Session="session"
+                                 @key="@($"focus-{session.Name}")"
+                                 Meta="meta"
+                                 IsCompleted="isCompleted"
+                                 IsInFocusStrip="true"
+                                 MessageCount="@(cardMessageCounts.TryGetValue(session.Name, out var fmc) ? fmc : DefaultCardMessageWindow)"
+                                 MinHeight="@_cardMinHeight"
+                                 StreamingContent="@(streamingBySession.TryGetValue(session.Name, out var fs) ? fs : "")"
+                                 ActivityText="@(activityBySession.TryGetValue(session.Name, out var fa) ? fa : "")"
+                                 CurrentToolName="@(currentToolBySession.TryGetValue(session.Name, out var ft) ? ft : "")"
+                                 ToolActivities="@(toolActivitiesBySession.TryGetValue(session.Name, out var fta) ? fta : new())"
+                                 Intent="@(intentBySession.TryGetValue(session.Name, out var fi) ? fi : "")"
+                                 Error="@(errorBySession.TryGetValue(session.Name, out var fe) ? fe : null)"
+                                 PendingImages="@(pendingImagesBySession.TryGetValue(session.Name, out var fpi) ? fpi : new())"
+                                 UserAvatarUrl="@CopilotService.GitHubAvatarUrl"
+                                 RepoUrl="@CopilotService.GetRepoUrlForSession(session.Name)"
+                                 Layout="@CopilotService.ChatLayout"
+                                 Style="@CopilotService.ChatStyle"
+                                 IsRenaming="@(cardRenamingSession == focusKey)"
+                                 IsMenuOpen="@(cardMenuSession == focusKey)"
+                                 OnGoTo="() => GoToSession(session.Name)"
+                                 OnToggleMenu="() => ToggleCardMenu(focusKey)"
+                                 OnExpand="() => ExpandSession(session.Name)"
+                                 OnLoadMore="() => LoadMoreCardMessages(session.Name)"
+                                 OnDismissError="() => DismissError(session.Name)"
+                                 OnClearQueue="() => ClearQueue(session.Name)"
+                                 OnRemovePendingImage="(idx) => RemovePendingImage(session.Name, idx)"
+                                 OnSend="(text) => SendFromCard(session.Name, text)"
+                                 OnStartRename="() => StartCardRename(focusKey)"
+                                 OnCommitRename="(newName) => CommitCardRename()"
+                                 OnCloseMenu="() => { cardMenuSession = null; }"
+                                 OnHandledInFocus="() => CopilotService.MarkFocusHandled(session.Name)" />
+                }
+            </div>
+            }
+        }
+
         @foreach (var (group, groupSessions) in CopilotService.GetOrganizedSessions())
         {
             var showGroupHeaders = CopilotService.HasMultipleGroups;
@@ -326,7 +387,7 @@
                         </button>
                     </div>
                 }
-                <div class="session-grid @(isCompactGrid ? "" : "expanded-grid")">
+                <div class="session-grid" style="grid-template-columns: repeat(@_gridColumns, 1fr)">
                 @foreach (var session in visibleSessions)
                 {
                     var isCompleted = completedSessions.Contains(session.Name);
@@ -337,6 +398,7 @@
                                  @key="session.Name"
                                  Meta="meta"
                                  IsCompleted="isCompleted"
+                                 MinHeight="@_cardMinHeight"
                                  MessageCount="@(cardMessageCounts.TryGetValue(session.Name, out var mc) ? mc : DefaultCardMessageWindow)"
                                  StreamingContent="@(streamingBySession.TryGetValue(session.Name, out var s) ? s : "")"
                                  ActivityText="@(activityBySession.TryGetValue(session.Name, out var a) ? a : "")"
@@ -389,7 +451,7 @@
         </div>
         @if (!isExternalCollapsed || hasActiveExternal)
         {
-            <div class="session-grid @(isCompactGrid ? "compact" : "")">
+            <div class="session-grid" style="grid-template-columns: repeat(@_gridColumns, 1fr)">
                 @foreach (var ext in externalSessions)
                 {
                     <ExternalSessionCard Session="ext" @key="ext.SessionId" />
@@ -402,6 +464,7 @@
     {
         <div class="font-bubble">@(fontSize)px</div>
     }
+
 </div>
 
 @code {
@@ -432,6 +495,8 @@
     private volatile bool _sessionSwitching; // true during ExpandSession to skip redundant JS interop
     private bool _loadMoreObserverInitialized;
     private bool isCompactGrid;  // true = compact cards, false = spacious cards
+    private int _gridColumns = 3;  // number of cards per row (2-6)
+    private int _cardMinHeight = 250;  // card minimum height in px (150-600, step 50)
     private bool isExternalCollapsed = true;  // external sessions collapsed by default
     private HashSet<string> _expandedWorkerGroups = new();  // group IDs where workers are shown
     private bool toolbarMenuOpen;
@@ -521,6 +586,12 @@
                 // Restore expanded grid state (inverted: isCompactGrid)
                 isCompactGrid = !uiState.ExpandedGrid;
                 Console.WriteLine($"[Dashboard] Set isCompactGrid = {isCompactGrid} (from ExpandedGrid={uiState.ExpandedGrid})");
+                
+                // Restore grid columns (default 3, minimum 2)
+                _gridColumns = uiState.GridColumns is >= 2 and <= 6 ? uiState.GridColumns : 3;
+                
+                // Restore card min height (default 250, range 150-600)
+                _cardMinHeight = uiState.CardMinHeight is >= 150 and <= 600 ? uiState.CardMinHeight : 250;
                 
                 // Restore expanded session state
                 if (!string.IsNullOrEmpty(uiState.ExpandedSession))
@@ -893,6 +964,14 @@
         // Restore drafts, focus, and scroll position — fire-and-forget to avoid blocking render pipeline
         _ = JS.InvokeVoidAsync("restoreDraftsAndFocus", draftsJson, focusId, selStart, selEnd, forceScroll);
 
+        // Restore dashboard grid scroll position after Blazor re-render
+        if (_pendingScrollTop > 0 && expandedSession == null)
+        {
+            var scrollTop = _pendingScrollTop;
+            _pendingScrollTop = 0;
+            _ = JS.InvokeVoidAsync("eval", $"var d = document.querySelector('.dashboard'); if (d) d.scrollTop = {scrollTop.ToString(System.Globalization.CultureInfo.InvariantCulture)};");
+        }
+
         // Set initial active slot on first render (MutationObserver will maintain it after user interactions)
         if (expandedSession != null)
         {
@@ -1042,6 +1121,28 @@
             catch { }
             Interlocked.Exchange(ref _lastDraftCaptureTickMs, Environment.TickCount64);
         }
+
+        // Save scroll position before re-render so it can be restored in OnAfterRenderAsync.
+        // Without this, Blazor DOM diffs cause the browser to reset scroll to top.
+        if (expandedSession == null) // Only in grid view — expanded mode has its own scroll
+        {
+            try
+            {
+                var scrollJson = await JS.InvokeAsync<string>("eval",
+                    "JSON.stringify({ top: document.querySelector('.dashboard')?.scrollTop ?? 0 })");
+                if (!string.IsNullOrEmpty(scrollJson))
+                {
+                    var scrollData = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, double>>(scrollJson);
+                    if (scrollData != null && scrollData.TryGetValue("top", out var top) && top > 0)
+                        _pendingScrollTop = top;
+                }
+            }
+            catch { }
+
+            // Save card-messages scroll positions before re-render so they survive DOM diffing.
+            try { _ = JS.InvokeVoidAsync("saveCardScrollPositions"); } catch { }
+        }
+
         _sessionSwitching = false;
         StateHasChanged();
     }
@@ -1049,6 +1150,7 @@
     private bool _explicitlyCollapsed;
     private bool _initialGridSet;
     private bool _refreshing;
+    private double _pendingScrollTop;
 
     private void RefreshState()
     {
@@ -2703,10 +2805,40 @@
         CopilotService.SaveUiState("/dashboard", activeSession: null, expandedSession: null, expandedGrid: !isCompactGrid);
     }
 
-    private void ToggleGridDensity()
+    private void IncrementGridColumns()
     {
-        isCompactGrid = !isCompactGrid;
-        CopilotService.SaveUiState("/dashboard", expandedGrid: !isCompactGrid, expandedSession: expandedSession);
+        if (_gridColumns < 6)
+        {
+            _gridColumns++;
+            CopilotService.SaveUiState("/dashboard", gridColumns: _gridColumns, expandedSession: expandedSession);
+        }
+    }
+
+    private void DecrementGridColumns()
+    {
+        if (_gridColumns > 2)
+        {
+            _gridColumns--;
+            CopilotService.SaveUiState("/dashboard", gridColumns: _gridColumns, expandedSession: expandedSession);
+        }
+    }
+
+    private void IncrementCardHeight()
+    {
+        if (_cardMinHeight < 600)
+        {
+            _cardMinHeight += 50;
+            CopilotService.SaveUiState("/dashboard", cardMinHeight: _cardMinHeight, expandedSession: expandedSession);
+        }
+    }
+
+    private void DecrementCardHeight()
+    {
+        if (_cardMinHeight > 150)
+        {
+            _cardMinHeight -= 50;
+            CopilotService.SaveUiState("/dashboard", cardMinHeight: _cardMinHeight, expandedSession: expandedSession);
+        }
     }
 
     private void ToggleCardMenu(string sessionName)
@@ -2734,8 +2866,10 @@
     private async Task CommitCardRename()
     {
         if (cardRenamingSession == null) return;
-        var oldName = cardRenamingSession;
+        var key = cardRenamingSession;
         cardRenamingSession = null;
+        // Strip focus strip prefix if present — the key is "focus:name" for focus strip cards
+        var oldName = key.StartsWith("focus:", StringComparison.Ordinal) ? key["focus:".Length..] : key;
 
         var newName = await JS.InvokeAsync<string>("getElementValue", "cardRenameInput");
         if (!string.IsNullOrWhiteSpace(newName) && newName.Trim() != oldName)
