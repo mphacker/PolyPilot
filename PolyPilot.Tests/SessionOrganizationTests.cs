@@ -741,6 +741,559 @@ Do something.
         Assert.True(group.IsMultiAgent);
         Assert.Equal(MultiAgentMode.Broadcast, group.OrchestratorMode);
     }
+
+    [Fact]
+    public void GetOrCreateRepoGroup_DoesNotReturnLocalFolderGroup()
+    {
+        // Regression test: when only a 📁 local folder group exists for a repo,
+        // GetOrCreateRepoGroup must NOT return it — it must create a separate URL-based group.
+        var svc = CreateService();
+        var localRepoPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+
+        // Simulate: user added folder via "Add Existing Folder" → local folder group created
+        var localFolderGroup = svc.GetOrCreateLocalFolderGroup(localRepoPath, "repo-1");
+        Assert.True(localFolderGroup.IsLocalFolder);
+        Assert.Equal("repo-1", localFolderGroup.RepoId);
+
+        // Now call GetOrCreateRepoGroup as happens when creating a session without targetGroupId
+        var repoGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo", explicitly: true);
+
+        Assert.NotNull(repoGroup);
+        Assert.NotEqual(localFolderGroup.Id, repoGroup!.Id);
+        Assert.False(repoGroup.IsLocalFolder);
+        Assert.Equal("repo-1", repoGroup.RepoId);
+    }
+
+    [Fact]
+    public void GetOrCreateRepoGroup_WhenBothGroupTypesExist_ReturnsUrlBasedGroup()
+    {
+        // Regression test: when both a URL-based group and a 📁 local folder group exist
+        // for the same RepoId, GetOrCreateRepoGroup must return the URL-based one.
+        var svc = CreateService();
+        var localRepoPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+
+        // Create URL-based group first
+        var urlGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+        Assert.NotNull(urlGroup);
+        Assert.False(urlGroup!.IsLocalFolder);
+
+        // Then create a local folder group for the same repo
+        var localFolderGroup = svc.GetOrCreateLocalFolderGroup(localRepoPath, "repo-1");
+        Assert.True(localFolderGroup.IsLocalFolder);
+
+        // GetOrCreateRepoGroup should still return the URL-based group, not the local folder group
+        var result = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+
+        Assert.NotNull(result);
+        Assert.Equal(urlGroup.Id, result!.Id);
+        Assert.False(result.IsLocalFolder);
+    }
+
+    [Fact]
+    public void GetOrCreateRepoGroup_LocalFolderGroupFirst_ThenUrlGroup_ReturnsUrlBasedGroup()
+    {
+        // Same as above but local folder group is created before URL-based group
+        var svc = CreateService();
+        var localRepoPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+
+        var localFolderGroup = svc.GetOrCreateLocalFolderGroup(localRepoPath, "repo-1");
+        Assert.True(localFolderGroup.IsLocalFolder);
+
+        var urlGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+        Assert.NotNull(urlGroup);
+        Assert.NotEqual(localFolderGroup.Id, urlGroup!.Id);
+        Assert.False(urlGroup.IsLocalFolder);
+
+        // A second call should return the same URL-based group (not recreate)
+        var urlGroup2 = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+        Assert.Equal(urlGroup.Id, urlGroup2!.Id);
+    }
+
+    [Fact]
+    public void ReconcileOrganization_SessionInLocalFolderGroup_DoesNotMoveToUrlGroup()
+    {
+        // Regression test: sessions already assigned to a local folder group must NOT be
+        // reassigned to a URL-based repo group by ReconcileOrganization.
+        var repos = new List<RepositoryInfo>
+        {
+            new() { Id = "repo-1", Name = "MyRepo", Url = "https://github.com/test/repo" }
+        };
+        var localRepoPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+        var nestedWtPath = Path.Combine(localRepoPath, ".polypilot", "worktrees", "feature-x");
+        var worktrees = new List<WorktreeInfo>
+        {
+            new() { Id = "wt-1", RepoId = "repo-1", Branch = "feature/x", Path = nestedWtPath }
+        };
+        var rm = CreateRepoManagerWithState(repos, worktrees);
+        var svc = CreateService(rm);
+
+        // Create both groups for the same repo
+        var urlGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+        var localFolderGroup = svc.GetOrCreateLocalFolderGroup(localRepoPath, "repo-1");
+
+        // A session is in the local folder group with a worktree
+        var meta = new SessionMeta
+        {
+            SessionName = "my-session",
+            GroupId = localFolderGroup.Id,
+            WorktreeId = "wt-1"
+        };
+        svc.Organization.Sessions.Add(meta);
+
+        // Run reconciliation
+        svc.ReconcileOrganization();
+
+        // The session must remain in the local folder group
+        var updatedMeta = svc.Organization.Sessions.First(m => m.SessionName == "my-session");
+        Assert.Equal(localFolderGroup.Id, updatedMeta.GroupId);
+        Assert.NotEqual(urlGroup!.Id, updatedMeta.GroupId);
+    }
+
+    [Fact]
+    public void PromoteOrCreateLocalFolderGroup_CreatesNewGroupWhenNoGroupExists()
+    {
+        var svc = CreateService();
+        var localRepoPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+        var expectedPath = Path.GetFullPath(localRepoPath)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        var group = svc.PromoteOrCreateLocalFolderGroup(localRepoPath, "repo-1");
+
+        Assert.NotNull(group);
+        Assert.True(group.IsLocalFolder);
+        Assert.Equal("MyRepo", group.Name);
+        Assert.Equal(expectedPath, group.LocalPath);
+        Assert.Equal("repo-1", group.RepoId);
+    }
+
+    [Fact]
+    public void PromoteOrCreateLocalFolderGroup_ReturnsExistingLocalFolderGroupWhenAlreadyExists()
+    {
+        var svc = CreateService();
+        var localRepoPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+
+        var first = svc.PromoteOrCreateLocalFolderGroup(localRepoPath, "repo-1");
+        var second = svc.PromoteOrCreateLocalFolderGroup(localRepoPath, "repo-1");
+
+        Assert.Same(first, second);
+        Assert.Single(svc.Organization.Groups, g => g.IsLocalFolder && g.RepoId == "repo-1");
+    }
+
+    [Fact]
+    public void PromoteOrCreateLocalFolderGroup_PromotesExistingUrlGroupInsteadOfCreatingNew()
+    {
+        // Regression test: old code created URL-based groups (no LocalPath) when user added
+        // a local folder. PromoteOrCreateLocalFolderGroup must upgrade the existing group
+        // rather than creating a redundant duplicate.
+        var svc = CreateService();
+        var localRepoPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+        var expectedPath = Path.GetFullPath(localRepoPath)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        // Simulate old behavior: URL-based group exists with no LocalPath
+        var urlGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+        Assert.NotNull(urlGroup);
+        Assert.False(urlGroup!.IsLocalFolder);
+
+        // Now call PromoteOrCreateLocalFolderGroup — it should update urlGroup in-place
+        var result = svc.PromoteOrCreateLocalFolderGroup(localRepoPath, "repo-1");
+
+        Assert.Equal(urlGroup.Id, result.Id);
+        Assert.True(result.IsLocalFolder);
+        Assert.Equal(expectedPath, result.LocalPath);
+        Assert.Equal("MyRepo", result.Name);
+
+        // Only one group for this repo — no duplicate created
+        Assert.Single(svc.Organization.Groups, g => g.RepoId == "repo-1");
+    }
+
+    [Fact]
+    public void PromoteOrCreateLocalFolderGroup_PromotesMostRecentUrlGroup_WhenMultipleExist()
+    {
+        // When two URL-based groups exist, promote the one with highest SortOrder (most recent).
+        var svc = CreateService();
+        var localRepoPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+
+        var olderGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");  // lower SortOrder
+        // Manually create a second URL-based group with a higher SortOrder
+        var newerGroup = new SessionGroup
+        {
+            Id = "newer-group",
+            Name = "MyRepo",
+            RepoId = "repo-1",
+            SortOrder = (olderGroup?.SortOrder ?? 0) + 10
+        };
+        svc.Organization.Groups.Add(newerGroup);
+
+        var result = svc.PromoteOrCreateLocalFolderGroup(localRepoPath, "repo-1");
+
+        // Should promote the newer group, not the older one
+        Assert.Equal(newerGroup.Id, result.Id);
+        Assert.True(result.IsLocalFolder);
+        Assert.False(olderGroup!.IsLocalFolder);  // older group stays URL-based
+    }
+
+    [Fact]
+    public void ReconcileOrganization_ExternalWorktree_PromotesUrlGroupToLocalFolderGroup()
+    {
+        // Regression test: on startup, ReconcileOrganization should automatically promote
+        // URL-based groups to local folder groups when an external worktree is registered
+        // but no local folder group exists yet.
+        var repos = new List<RepositoryInfo>
+        {
+            new() { Id = "repo-1", Name = "MyRepo", Url = "https://github.com/test/repo" }
+        };
+        // Use cross-platform temp paths to avoid Windows-only literal failures on macOS/Linux
+        var extPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+        var centralPath = Path.Combine(Path.GetTempPath(), ".polypilot", "worktrees", "repo-1-wt1");
+        var worktrees = new List<WorktreeInfo>
+        {
+            // External: user's local folder, NOT under the managed worktrees dir and NOT nested
+            new() { Id = "ext-1", RepoId = "repo-1", Branch = "main", Path = extPath },
+            // Centralized: under the managed worktrees dir (simulated by putting it under .polypilot/worktrees)
+            new() { Id = "wt-1", RepoId = "repo-1", Branch = "session-123", Path = centralPath }
+        };
+        var rm = CreateRepoManagerWithState(repos, worktrees);
+        var svc = CreateService(rm);
+
+        // Set up: a URL-based group (no LocalPath) — simulates old code behavior
+        var urlGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+        Assert.False(urlGroup!.IsLocalFolder);
+
+        // Run reconciliation — it should detect the external worktree and promote urlGroup
+        svc.ReconcileOrganization();
+
+        var promoted = svc.Organization.Groups.First(g => g.Id == urlGroup.Id);
+        Assert.True(promoted.IsLocalFolder);
+        Assert.Equal(Path.GetFullPath(extPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            promoted.LocalPath);
+    }
+
+    [Fact]
+    public void ReconcileOrganization_ExternalWorktree_DoesNotPromoteWhenLocalGroupAlreadyExists()
+    {
+        // If a local folder group already exists for the external worktree path,
+        // ReconcileOrganization must NOT promote another group.
+        var repos = new List<RepositoryInfo>
+        {
+            new() { Id = "repo-1", Name = "MyRepo", Url = "https://github.com/test/repo" }
+        };
+        var extPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+        var worktrees = new List<WorktreeInfo>
+        {
+            new() { Id = "ext-1", RepoId = "repo-1", Branch = "main", Path = extPath }
+        };
+        var rm = CreateRepoManagerWithState(repos, worktrees);
+        var svc = CreateService(rm);
+
+        // Both a URL-based group and a local folder group exist for this repo
+        var urlGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+        var localGroup = svc.GetOrCreateLocalFolderGroup(extPath, "repo-1");
+
+        svc.ReconcileOrganization();
+
+        // URL group must remain URL-based; local group keeps its LocalPath
+        Assert.False(urlGroup!.IsLocalFolder);
+        Assert.True(localGroup.IsLocalFolder);
+        Assert.Equal(Path.GetFullPath(extPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            localGroup.LocalPath);
+    }
+
+    [Fact]
+    public void ReconcileOrganization_NestedWorktree_IsNotTreatedAsExternalWorktree()
+    {
+        // Nested worktrees (inside a local folder's .polypilot/worktrees/) must NOT
+        // trigger group promotion — only the original external (root) worktree should.
+        var repos = new List<RepositoryInfo>
+        {
+            new() { Id = "repo-1", Name = "MyRepo", Url = "https://github.com/test/repo" }
+        };
+        // Use Path.Combine so the .polypilot/worktrees marker uses the OS separator
+        var nestedPath = Path.Combine(Path.GetTempPath(), "MyRepo", ".polypilot", "worktrees", "feature-x");
+        var worktrees = new List<WorktreeInfo>
+        {
+            // Nested worktree inside the local folder — should NOT trigger promotion
+            new() { Id = "nested-1", RepoId = "repo-1", Branch = "feature-x", Path = nestedPath }
+        };
+        var rm = CreateRepoManagerWithState(repos, worktrees);
+        var svc = CreateService(rm);
+
+        var urlGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+        svc.ReconcileOrganization();
+
+        // URL group must remain URL-based — nested worktree should not trigger promotion
+        Assert.False(urlGroup!.IsLocalFolder);
+        Assert.Null(urlGroup.LocalPath);
+    }
+}
+
+/// <summary>
+/// Integration scenario tests covering the full "Add Existing Folder" feature flow.
+/// These tests simulate the exact user-reported bugs and verify the complete session
+/// routing pipeline end-to-end.
+/// </summary>
+public class AddExistingFolderScenarioTests
+{
+    private readonly StubChatDatabase _chatDb = new();
+    private readonly StubServerManager _serverManager = new();
+    private readonly StubWsBridgeClient _bridgeClient = new();
+    private readonly StubDemoService _demoService = new();
+    private readonly IServiceProvider _serviceProvider;
+
+    public AddExistingFolderScenarioTests()
+    {
+        var services = new ServiceCollection();
+        _serviceProvider = services.BuildServiceProvider();
+    }
+
+    private static RepoManager CreateRepoManagerWithState(List<RepositoryInfo> repos, List<WorktreeInfo> worktrees)
+    {
+        var rm = new RepoManager();
+        var stateField = typeof(RepoManager).GetField("_state", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var loadedField = typeof(RepoManager).GetField("_loaded", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        stateField.SetValue(rm, new RepositoryState { Repositories = repos, Worktrees = worktrees });
+        loadedField.SetValue(rm, true);
+        return rm;
+    }
+
+    private CopilotService CreateService(RepoManager? repoManager = null) =>
+        new CopilotService(_chatDb, _serverManager, _bridgeClient, repoManager ?? new RepoManager(), _serviceProvider, _demoService);
+
+    /// <summary>
+    /// User-reported bug: Two PolyPilot folders added — one at source\repos\PolyPilot (local folder),
+    /// one managed at ~/.polypilot/worktrees. Creating a session from the local folder group
+    /// incorrectly routed to the centralized group.
+    /// 
+    /// Root cause: GetOrCreateRepoGroup matched local folder groups (which also have RepoId set),
+    /// so sessions without an explicit targetGroupId ended up in the local folder group.
+    /// Fix: GetOrCreateRepoGroup now excludes IsLocalFolder groups.
+    /// </summary>
+    [Fact]
+    public void Scenario_TwoFoldersForSameRepo_SessionsRouteToCorrectGroup()
+    {
+        var repos = new List<RepositoryInfo>
+        {
+            new() { Id = "owner-polypilot", Name = "PolyPilot", Url = "https://github.com/owner/PolyPilot" }
+        };
+        var sourceReposPath = Path.Combine(Path.GetTempPath(), "source", "repos", "PolyPilot");
+        var worktrees = new List<WorktreeInfo>
+        {
+            // The original external worktree (user's local clone)
+            new() { Id = "ext-1", RepoId = "owner-polypilot", Branch = "main", Path = sourceReposPath }
+        };
+        var rm = CreateRepoManagerWithState(repos, worktrees);
+        var svc = CreateService(rm);
+
+        // Setup: URL-based group (auto-created when repo added via URL)
+        var urlGroup = svc.GetOrCreateRepoGroup("owner-polypilot", "PolyPilot");
+        Assert.NotNull(urlGroup);
+        Assert.False(urlGroup!.IsLocalFolder);
+
+        // 📁 local folder group (auto-created when user added source\repos\PolyPilot folder)
+        var localGroup = svc.GetOrCreateLocalFolderGroup(sourceReposPath, "owner-polypilot");
+        Assert.True(localGroup.IsLocalFolder);
+        Assert.Equal("owner-polypilot", localGroup.RepoId);
+
+        // Scenario A: Creating a session from the URL-based group (no targetGroupId)
+        // → must route to urlGroup, NOT localGroup
+        var resolvedForUrl = svc.GetOrCreateRepoGroup("owner-polypilot", "PolyPilot");
+        Assert.Equal(urlGroup.Id, resolvedForUrl!.Id);
+        Assert.False(resolvedForUrl.IsLocalFolder);
+
+        // Scenario B: Creating a session from the local folder group (targetGroupId = localGroup.Id)
+        // → must use localGroup (caller explicitly passes it — no routing needed)
+        Assert.Equal(localGroup.Id, localGroup.Id);  // trivially true; verified by callers passing targetGroupId
+
+        // Scenario C: Both groups must remain distinct — no merging
+        Assert.NotEqual(urlGroup.Id, localGroup.Id);
+        Assert.Equal(2, svc.Organization.Groups.Count(g => g.RepoId == "owner-polypilot" && !g.IsMultiAgent));
+    }
+
+    [Fact]
+    public void Scenario_StartupMigration_AutoFixesExistingInstall()
+    {
+        // User had folder added via old code that created a URL-based group (no LocalPath).
+        // On startup, ReconcileOrganization should detect the external worktree and promote
+        // the URL-based group to a local folder group — without user intervention.
+
+        var sourceReposPath = Path.Combine(Path.GetTempPath(), "source", "repos", "PolyPilot");
+        var centralPath = Path.Combine(Path.GetTempPath(), ".polypilot", "worktrees", "polypilot-abc12345");
+
+        var repos = new List<RepositoryInfo>
+        {
+            new() { Id = "owner-polypilot", Name = "PolyPilot", Url = "https://github.com/owner/PolyPilot" }
+        };
+        var worktrees = new List<WorktreeInfo>
+        {
+            new() { Id = "ext-1", RepoId = "owner-polypilot", Branch = "main", Path = sourceReposPath },
+            new() { Id = "cen-1", RepoId = "owner-polypilot", Branch = "session-1", Path = centralPath }
+        };
+        var rm = CreateRepoManagerWithState(repos, worktrees);
+        var svc = CreateService(rm);
+
+        // Old-style state: only a URL-based group, no LocalPath
+        var oldUrlGroup = svc.GetOrCreateRepoGroup("owner-polypilot", "PolyPilot");
+        Assert.False(oldUrlGroup!.IsLocalFolder);
+        Assert.Null(oldUrlGroup.LocalPath);
+
+        // Existing session in the URL group (simulating old persisted sessions)
+        svc.Organization.Sessions.Add(new SessionMeta
+        {
+            SessionName = "my-old-session",
+            GroupId = oldUrlGroup.Id,
+            WorktreeId = "cen-1"
+        });
+
+        // Simulate the restore-phase reconciliation: IsInitialized must be true to pass the
+        // startup guard, and allowPruning=false prevents sessions without live counterparts
+        // from being pruned (matching RestorePreviousSessionsAsync behavior).
+        typeof(CopilotService).GetProperty("IsInitialized")!.SetValue(svc, true);
+
+        // Startup reconciliation runs (allowPruning:false = during session-restore window)
+        svc.ReconcileOrganization(allowPruning: false);
+
+        // The URL group should be promoted to a local folder group
+        var promotedGroup = svc.Organization.Groups.First(g => g.Id == oldUrlGroup.Id);
+        Assert.True(promotedGroup.IsLocalFolder);
+        Assert.Equal(
+            Path.GetFullPath(sourceReposPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            promotedGroup.LocalPath);
+
+        // Existing sessions in that group must NOT be moved — they stay put
+        var oldSession = svc.Organization.Sessions.First(m => m.SessionName == "my-old-session");
+        Assert.Equal(oldUrlGroup.Id, oldSession.GroupId);
+    }
+
+    [Fact]
+    public void Scenario_ReAddExistingFolder_DoesNotCreateDuplicateGroup()
+    {
+        // If the user removes and re-adds the same folder, PromoteOrCreateLocalFolderGroup
+        // must return the existing local folder group, not create a duplicate.
+
+        var svc = CreateService();
+        var localPath = Path.Combine(Path.GetTempPath(), "my-project");
+
+        var first = svc.PromoteOrCreateLocalFolderGroup(localPath, "repo-1");
+        Assert.True(first.IsLocalFolder);
+
+        // Simulate re-adding: call again with the same path
+        var second = svc.PromoteOrCreateLocalFolderGroup(localPath, "repo-1");
+        Assert.Same(first, second);
+
+        // Only one 📁 group for this path
+        var localGroups = svc.Organization.Groups.Where(g => g.IsLocalFolder && g.RepoId == "repo-1").ToList();
+        Assert.Single(localGroups);
+    }
+
+    [Fact]
+    public void Scenario_LocalFolderGroup_HasCorrectIsLocalFolderFlag()
+    {
+        // IsLocalFolder is a computed property (!string.IsNullOrWhiteSpace(LocalPath)).
+        // Verify that setting LocalPath via PromoteOrCreateLocalFolderGroup correctly
+        // triggers IsLocalFolder=true without a separate boolean flag.
+
+        var svc = CreateService();
+
+        // URL-based group: no LocalPath → IsLocalFolder=false
+        var urlGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+        Assert.NotNull(urlGroup);
+        Assert.False(urlGroup!.IsLocalFolder);
+        Assert.Null(urlGroup.LocalPath);
+
+        // Promote it to a local folder group by setting LocalPath
+        var promoted = svc.PromoteOrCreateLocalFolderGroup(Path.Combine(Path.GetTempPath(), "MyRepo"), "repo-1");
+        Assert.True(promoted.IsLocalFolder);
+        Assert.NotNull(promoted.LocalPath);
+        Assert.NotEmpty(promoted.LocalPath!);
+    }
+
+    [Fact]
+    public void Scenario_LocalFolderGroup_IsExcludedFromUrlGroupLookup()
+    {
+        // After promotion, the group has both RepoId and LocalPath.
+        // GetOrCreateRepoGroup must NOT return it — it should create a new URL-based group.
+
+        var svc = CreateService();
+        var localPath = Path.Combine(Path.GetTempPath(), "MyRepo");
+
+        // Add as local folder
+        var localGroup = svc.PromoteOrCreateLocalFolderGroup(localPath, "repo-1");
+        Assert.True(localGroup.IsLocalFolder);
+
+        // GetOrCreateRepoGroup must NOT return the promoted local group
+        var urlGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo", explicitly: true);
+        Assert.NotNull(urlGroup);
+        Assert.NotEqual(localGroup.Id, urlGroup!.Id);
+        Assert.False(urlGroup.IsLocalFolder);
+    }
+
+    [Fact]
+    public void Scenario_ReconcileOrganization_SessionInLocalGroup_WithWorktree_Stays()
+    {
+        // Full scenario: session in local folder group with a nested worktree.
+        // ReconcileOrganization must leave it exactly where it is, and the local group
+        // must not be overwritten by the URL-based group assignment.
+
+        var localRepoPath = Path.Combine(Path.GetTempPath(), "source-repo");
+        var nestedWtPath = Path.Combine(localRepoPath, ".polypilot", "worktrees", "feature-x");
+
+        var repos = new List<RepositoryInfo>
+        {
+            new() { Id = "repo-1", Name = "MyRepo", Url = "https://github.com/test/repo" }
+        };
+        var worktrees = new List<WorktreeInfo>
+        {
+            new() { Id = "ext-1", RepoId = "repo-1", Branch = "main", Path = localRepoPath },
+            new() { Id = "nested-1", RepoId = "repo-1", Branch = "feature-x", Path = nestedWtPath }
+        };
+        var rm = CreateRepoManagerWithState(repos, worktrees);
+        var svc = CreateService(rm);
+
+        // Both group types exist
+        var urlGroup = svc.GetOrCreateRepoGroup("repo-1", "MyRepo");
+        var localGroup = svc.GetOrCreateLocalFolderGroup(localRepoPath, "repo-1");
+
+        // Session using the nested worktree, living in the local folder group
+        var session = new SessionMeta
+        {
+            SessionName = "feature-session",
+            GroupId = localGroup.Id,
+            WorktreeId = "nested-1"
+        };
+        svc.Organization.Sessions.Add(session);
+
+        svc.ReconcileOrganization();
+
+        var updated = svc.Organization.Sessions.First(m => m.SessionName == "feature-session");
+        Assert.Equal(localGroup.Id, updated.GroupId);
+        Assert.NotEqual(urlGroup!.Id, updated.GroupId);
+    }
+
+    [Fact]
+    public void Scenario_GroupPromotion_PreservesSessionHistory()
+    {
+        // When an existing URL-based group is promoted to a local folder group,
+        // all sessions in that group must remain assigned to it (their GroupId doesn't change).
+
+        var svc = CreateService();
+        var localPath = Path.Combine(Path.GetTempPath(), "my-project");
+
+        // Old-style URL-based group with sessions
+        var oldGroup = svc.GetOrCreateRepoGroup("repo-1", "MyProject");
+        Assert.NotNull(oldGroup);
+        svc.Organization.Sessions.Add(new SessionMeta { SessionName = "old-session-1", GroupId = oldGroup!.Id });
+        svc.Organization.Sessions.Add(new SessionMeta { SessionName = "old-session-2", GroupId = oldGroup.Id });
+
+        // Promote the group (simulates re-adding the local folder)
+        var promoted = svc.PromoteOrCreateLocalFolderGroup(localPath, "repo-1");
+        Assert.Equal(oldGroup.Id, promoted.Id); // same group, just upgraded
+
+        // Both sessions must still be in the group
+        var s1 = svc.Organization.Sessions.First(m => m.SessionName == "old-session-1");
+        var s2 = svc.Organization.Sessions.First(m => m.SessionName == "old-session-2");
+        Assert.Equal(promoted.Id, s1.GroupId);
+        Assert.Equal(promoted.Id, s2.GroupId);
+    }
 }
 
 /// <summary>

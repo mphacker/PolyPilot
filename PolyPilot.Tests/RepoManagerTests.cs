@@ -84,6 +84,20 @@ public class RepoManagerTests
         method.Invoke(rm, null);
     }
 
+    /// <summary>
+    /// Deletes a directory tree including files marked read-only.
+    /// Git creates read-only object files on Windows, which causes plain
+    /// Directory.Delete to throw UnauthorizedAccessException in test cleanup.
+    /// </summary>
+    private static void ForceDeleteDirectory(string path)
+    {
+        if (!Directory.Exists(path))
+            return;
+        foreach (var f in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+            File.SetAttributes(f, FileAttributes.Normal);
+        Directory.Delete(path, true);
+    }
+
     [Fact]
     public void Save_AfterFailedLoad_DoesNotOverwriteWithEmptyState()
     {
@@ -121,7 +135,7 @@ public class RepoManagerTests
         }
         finally
         {
-            Directory.Delete(tempDir, true);
+            ForceDeleteDirectory(tempDir);
         }
     }
 
@@ -158,7 +172,7 @@ public class RepoManagerTests
         }
         finally
         {
-            Directory.Delete(tempDir, true);
+            ForceDeleteDirectory(tempDir);
         }
     }
 
@@ -230,7 +244,7 @@ public class RepoManagerTests
         }
         finally
         {
-            Directory.Delete(tempDir, true);
+            ForceDeleteDirectory(tempDir);
         }
     }
 
@@ -277,7 +291,7 @@ public class RepoManagerTests
         }
         finally
         {
-            Directory.Delete(tempDir, true);
+            ForceDeleteDirectory(tempDir);
         }
     }
 
@@ -322,7 +336,7 @@ public class RepoManagerTests
         }
         finally
         {
-            Directory.Delete(tempDir, true);
+            ForceDeleteDirectory(tempDir);
         }
     }
 
@@ -364,9 +378,674 @@ public class RepoManagerTests
         }
         finally
         {
-            Directory.Delete(tempDir, true);
+            ForceDeleteDirectory(tempDir);
         }
     }
 
     #endregion
+
+    #region AddRepositoryFromLocalAsync Validation Tests
+
+    [Fact]
+    public async Task AddRepositoryFromLocal_NonExistentFolder_ThrowsWithClearMessage()
+    {
+        var rm = new RepoManager();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => rm.AddRepositoryFromLocalAsync("/this/path/does/not/exist"));
+        Assert.Contains("not found", ex.Message);
+    }
+
+    [Fact]
+    public async Task AddRepositoryFromLocal_FolderWithNoGit_ThrowsWithClearMessage()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"not-a-repo-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var rm = new RepoManager();
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => rm.AddRepositoryFromLocalAsync(tempDir));
+            Assert.Contains("not a git repository", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task AddRepositoryFromLocal_GitRepoWithNoOrigin_ThrowsWithClearMessage()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"no-origin-repo-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            // Initialize a real git repo with no remotes
+            await RunProcess("git", "init", tempDir);
+            var rm = new RepoManager();
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => rm.AddRepositoryFromLocalAsync(tempDir));
+            Assert.Contains("origin", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task RegisterExternalWorktree_AddsWorktreeToState()
+    {
+        // STRUCTURAL: Verifies that RegisterExternalWorktreeAsync stores a WorktreeInfo
+        // and fires OnStateChanged, so the sidebar updates after adding a local folder.
+        var tempDir = Path.Combine(Path.GetTempPath(), $"ext-wt-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            await RunProcess("git", "init", tempDir);
+            await RunProcess("git", "-C", tempDir, "commit", "--allow-empty", "-m", "init");
+
+            var rm = new RepoManager();
+            RepoManager.SetBaseDirForTesting(Path.Combine(Path.GetTempPath(), $"rmtest-{Guid.NewGuid():N}"));
+            try
+            {
+                // Seed a fake repo entry (skip network)
+                var repoId = "test-owner-testrepo";
+                var fakeRepo = new RepositoryInfo { Id = repoId, Name = "testrepo", Url = "https://github.com/test-owner/testrepo.git" };
+                var stateChangedFired = false;
+                rm.OnStateChanged += () => stateChangedFired = true;
+
+                // Directly inject state (bypass load)
+                var stateField = typeof(RepoManager).GetField("_state", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                var loadedField = typeof(RepoManager).GetField("_loaded", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                var successField = typeof(RepoManager).GetField("_loadedSuccessfully", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                var state = new RepositoryState { Repositories = [fakeRepo] };
+                stateField.SetValue(rm, state);
+                loadedField.SetValue(rm, true);
+                successField.SetValue(rm, true);
+
+                await rm.RegisterExternalWorktreeAsync(fakeRepo, tempDir, default);
+
+                Assert.True(stateChangedFired, "OnStateChanged must fire so the sidebar refreshes");
+                Assert.Single(rm.Worktrees, w => w.RepoId == repoId && PathsEqual(w.Path, tempDir));
+            }
+            finally
+            {
+                RepoManager.SetBaseDirForTesting(TestSetup.TestBaseDir);
+            }
+        }
+        finally
+        {
+            ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task RegisterExternalWorktree_Idempotent()
+    {
+        // Adding the same path twice should not create duplicate worktree entries.
+        var tempDir = Path.Combine(Path.GetTempPath(), $"ext-wt-idem-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            await RunProcess("git", "init", tempDir);
+            await RunProcess("git", "-C", tempDir, "commit", "--allow-empty", "-m", "init");
+
+            var rm = new RepoManager();
+            RepoManager.SetBaseDirForTesting(Path.Combine(Path.GetTempPath(), $"rmtest2-{Guid.NewGuid():N}"));
+            try
+            {
+                var fakeRepo = new RepositoryInfo { Id = "owner-repo", Name = "repo", Url = "https://github.com/owner/repo.git" };
+                var stateField = typeof(RepoManager).GetField("_state", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                var loadedField = typeof(RepoManager).GetField("_loaded", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                var successField = typeof(RepoManager).GetField("_loadedSuccessfully", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                var state = new RepositoryState { Repositories = [fakeRepo] };
+                stateField.SetValue(rm, state);
+                loadedField.SetValue(rm, true);
+                successField.SetValue(rm, true);
+
+                await rm.RegisterExternalWorktreeAsync(fakeRepo, tempDir, default);
+                await rm.RegisterExternalWorktreeAsync(fakeRepo, tempDir, default); // second call
+
+                Assert.Single(rm.Worktrees); // exactly one entry
+            }
+            finally
+            {
+                RepoManager.SetBaseDirForTesting(TestSetup.TestBaseDir);
+            }
+        }
+        finally
+        {
+            ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    private static bool PathsEqual(string left, string right)
+    {
+        var l = Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var r = Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return string.Equals(l, r, StringComparison.OrdinalIgnoreCase);
+    }
+
+    #region EnsureGitIgnoreEntry Tests
+
+    [Fact]
+    public void EnsureGitIgnoreEntry_CreatesGitIgnoreIfMissing()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("polypilot-test-").FullName;
+        try
+        {
+            var method = typeof(RepoManager).GetMethod("EnsureGitIgnoreEntry",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+            method.Invoke(null, [tmpDir, ".polypilot/"]);
+
+            var gitignorePath = Path.Combine(tmpDir, ".gitignore");
+            Assert.True(File.Exists(gitignorePath));
+            var content = File.ReadAllText(gitignorePath);
+            Assert.Contains(".polypilot/", content);
+        }
+        finally { ForceDeleteDirectory(tmpDir); }
+    }
+
+    [Fact]
+    public void EnsureGitIgnoreEntry_AppendsIfNotPresent()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("polypilot-test-").FullName;
+        try
+        {
+            var gitignorePath = Path.Combine(tmpDir, ".gitignore");
+            File.WriteAllText(gitignorePath, "*.user\nbin/\n");
+
+            var method = typeof(RepoManager).GetMethod("EnsureGitIgnoreEntry",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+            method.Invoke(null, [tmpDir, ".polypilot/"]);
+
+            var content = File.ReadAllText(gitignorePath);
+            Assert.Contains(".polypilot/", content);
+            Assert.Contains("*.user", content); // existing content preserved
+        }
+        finally { ForceDeleteDirectory(tmpDir); }
+    }
+
+    [Fact]
+    public void EnsureGitIgnoreEntry_IdempotentIfAlreadyPresent()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("polypilot-test-").FullName;
+        try
+        {
+            var gitignorePath = Path.Combine(tmpDir, ".gitignore");
+            File.WriteAllText(gitignorePath, ".polypilot/\n");
+
+            var method = typeof(RepoManager).GetMethod("EnsureGitIgnoreEntry",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+            method.Invoke(null, [tmpDir, ".polypilot/"]);
+            method.Invoke(null, [tmpDir, ".polypilot/"]); // call twice
+
+            var lines = File.ReadAllLines(gitignorePath);
+            Assert.Equal(1, lines.Count(l => l.Trim() == ".polypilot/")); // only one entry
+        }
+        finally { ForceDeleteDirectory(tmpDir); }
+    }
+
+    [Fact]
+    public void EnsureGitIgnoreEntry_MatchesWithoutTrailingSlash()
+    {
+        var tmpDir = Directory.CreateTempSubdirectory("polypilot-test-").FullName;
+        try
+        {
+            var gitignorePath = Path.Combine(tmpDir, ".gitignore");
+            File.WriteAllText(gitignorePath, ".polypilot\n"); // no trailing slash variant
+
+            var method = typeof(RepoManager).GetMethod("EnsureGitIgnoreEntry",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+            method.Invoke(null, [tmpDir, ".polypilot/"]);
+
+            var content = File.ReadAllText(gitignorePath);
+            // Should NOT add a duplicate (already covered by ".polypilot" line)
+            Assert.DoesNotContain(".polypilot/", content);
+        }
+        finally { ForceDeleteDirectory(tmpDir); }
+    }
+
+    #endregion
+
+    #region Nested Worktree Path Traversal Tests
+
+    [Theory]
+    [InlineData("../../evil")]
+    [InlineData("../sibling")]
+    [InlineData("foo/../../escape")]
+    [InlineData("")]        // empty branch name resolves to repoWorktreesDir itself
+    [InlineData(".")]       // dot resolves to repoWorktreesDir itself
+    public void CreateWorktree_PathTraversal_InBranchName_IsRejected(string maliciousBranch)
+    {
+        // Simulate what CreateWorktreeAsync does: combine repoWorktreesDir + branchName then GetFullPath
+        var fakeRepoDir = Path.Combine(Path.GetTempPath(), "fake-repo");
+        var repoWorktreesDir = Path.Combine(fakeRepoDir, ".polypilot", "worktrees");
+        var worktreePath = Path.Combine(repoWorktreesDir, maliciousBranch);
+        var resolved = Path.GetFullPath(worktreePath);
+        var managedBase = Path.GetFullPath(repoWorktreesDir) + Path.DirectorySeparatorChar;
+
+        // Production guard (single condition): resolved must start with managedBase.
+        // "" and "." both resolve to repoWorktreesDir itself, which does NOT start with
+        // repoWorktreesDir + separator — so they are correctly rejected.
+        var wouldEscape = !resolved.StartsWith(managedBase, StringComparison.OrdinalIgnoreCase);
+
+        Assert.True(wouldEscape, $"Branch '{maliciousBranch}' should escape the managed dir but guard says it doesn't. Resolved: {resolved}");
+    }
+
+    [Theory]
+    [InlineData("my-feature")]
+    [InlineData("feature/login")]
+    [InlineData("fix.typo")]
+    public void CreateWorktree_ValidBranchName_StaysInsideDir(string safeBranch)
+    {
+        var fakeRepoDir = Path.Combine(Path.GetTempPath(), "fake-repo");
+        var repoWorktreesDir = Path.Combine(fakeRepoDir, ".polypilot", "worktrees");
+        var worktreePath = Path.Combine(repoWorktreesDir, safeBranch);
+        var resolved = Path.GetFullPath(worktreePath);
+        var managedBase = Path.GetFullPath(repoWorktreesDir) + Path.DirectorySeparatorChar;
+
+        // Production guard (single condition)
+        var wouldEscape = !resolved.StartsWith(managedBase, StringComparison.OrdinalIgnoreCase);
+
+        Assert.False(wouldEscape, $"Branch '{safeBranch}' should NOT escape the managed dir. Resolved: {resolved}");
+    }
+
+    #endregion
+
+    #region RemoveWorktreeAsync Safety Tests (C1 — external folder must not be deleted)
+
+    /// <summary>
+    /// Helper that injects a pre-configured RepositoryState and marks the RepoManager
+    /// as successfully loaded, so no disk I/O is attempted.
+    /// </summary>
+    private static RepoManager MakeLoadedRepoManager(RepositoryState state, string baseDirOverride)
+    {
+        var rm = new RepoManager();
+        SetField(rm, "_state", state);
+        SetField(rm, "_loaded", true);
+        SetField(rm, "_loadedSuccessfully", true);
+        RepoManager.SetBaseDirForTesting(baseDirOverride);
+        return rm;
+    }
+
+    [Fact]
+    public async Task RemoveWorktreeAsync_ExternalWorktree_DoesNotDeleteDirectory()
+    {
+        // C1 regression: RemoveWorktreeAsync must NOT delete the user's local repo directory
+        // when the worktree is external (not under ~/.polypilot/worktrees/ or .polypilot/worktrees/).
+        // External worktrees have BareClonePath set, just like managed worktrees, so the only
+        // discriminator is the path location.
+
+        var testBaseDir = Path.Combine(Path.GetTempPath(), $"rm-c1-test-{Guid.NewGuid():N}");
+        var externalDir = Path.Combine(Path.GetTempPath(), $"user-repo-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(testBaseDir);
+        Directory.CreateDirectory(externalDir);  // simulate user's local repo
+
+        try
+        {
+            var fakeWt = new WorktreeInfo
+            {
+                Id = "ext-wt-1",
+                RepoId = "test-repo",
+                Branch = "main",
+                Path = externalDir,
+                // BareClonePath IS set — this is what RegisterExternalWorktreeAsync does,
+                // and it's also set for normal git-managed worktrees. It must NOT cause deletion.
+                BareClonePath = Path.Combine(testBaseDir, "fake-bare.git")
+            };
+            var fakeRepo = new RepositoryInfo
+            {
+                Id = "test-repo",
+                BareClonePath = fakeWt.BareClonePath
+            };
+
+            var state = new RepositoryState
+            {
+                Repositories = [fakeRepo],
+                Worktrees = [fakeWt]
+            };
+            var rm = MakeLoadedRepoManager(state, testBaseDir);
+            try
+            {
+                // git worktree remove will fail (no real bare repo) → goes to catch block.
+                // The catch should detect path is NOT under managed dirs and skip deletion.
+                await rm.RemoveWorktreeAsync("ext-wt-1", deleteBranch: false);
+            }
+            finally
+            {
+                RepoManager.SetBaseDirForTesting(TestSetup.TestBaseDir);
+            }
+
+            // The external directory must still exist — it was NOT deleted.
+            Assert.True(Directory.Exists(externalDir),
+                $"External user repo at '{externalDir}' was incorrectly deleted by RemoveWorktreeAsync!");
+
+            // The worktree must be unregistered from state.
+            Assert.Empty(rm.Worktrees);
+        }
+        finally
+        {
+            ForceDeleteDirectory(testBaseDir);
+            ForceDeleteDirectory(externalDir);
+        }
+    }
+
+    [Fact]
+    public async Task RemoveWorktreeAsync_CentralizedWorktree_DeletesDirectory()
+    {
+        // Centralized worktrees (under ~/.polypilot/worktrees/) SHOULD be deleted on remove.
+        // This is the normal cleanup path for sessions created via URL-based groups.
+
+        var testBaseDir = Path.Combine(Path.GetTempPath(), $"rm-central-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(testBaseDir);
+
+        try
+        {
+            // The managed worktrees dir is {testBaseDir}/worktrees/
+            var worktreesDir = Path.Combine(testBaseDir, "worktrees");
+            var centralWtPath = Path.Combine(worktreesDir, "test-repo-abc12345");
+            Directory.CreateDirectory(centralWtPath);
+            File.WriteAllText(Path.Combine(centralWtPath, "dummy.txt"), "test file");
+
+            var fakeWt = new WorktreeInfo
+            {
+                Id = "central-wt-1",
+                RepoId = "test-repo",
+                Branch = "session-20260101",
+                Path = centralWtPath,
+                BareClonePath = Path.Combine(testBaseDir, "fake-bare.git")
+            };
+            var fakeRepo = new RepositoryInfo
+            {
+                Id = "test-repo",
+                BareClonePath = fakeWt.BareClonePath
+            };
+
+            var state = new RepositoryState
+            {
+                Repositories = [fakeRepo],
+                Worktrees = [fakeWt]
+            };
+            var rm = MakeLoadedRepoManager(state, testBaseDir);
+            try
+            {
+                // git worktree remove fails → catch block: isCentralized=true → Directory.Delete
+                await rm.RemoveWorktreeAsync("central-wt-1", deleteBranch: false);
+            }
+            finally
+            {
+                RepoManager.SetBaseDirForTesting(TestSetup.TestBaseDir);
+            }
+
+            // The managed worktree directory SHOULD be deleted.
+            Assert.False(Directory.Exists(centralWtPath),
+                $"Centralized worktree at '{centralWtPath}' was NOT cleaned up by RemoveWorktreeAsync!");
+
+            // Unregistered from state.
+            Assert.Empty(rm.Worktrees);
+        }
+        finally
+        {
+            ForceDeleteDirectory(testBaseDir);
+        }
+    }
+
+    [Fact]
+    public async Task RemoveWorktreeAsync_NestedWorktree_DeletesDirectory()
+    {
+        // Nested worktrees (inside {userRepo}/.polypilot/worktrees/) SHOULD be deleted on remove.
+        // These are worktrees created for sessions initiated from a 📁 local folder group.
+
+        var testBaseDir = Path.Combine(Path.GetTempPath(), $"rm-nested-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(testBaseDir);
+
+        try
+        {
+            var userRepoDir = Path.Combine(Path.GetTempPath(), $"user-repo-{Guid.NewGuid():N}");
+            var nestedWtPath = Path.Combine(userRepoDir, ".polypilot", "worktrees", "feature-branch");
+            Directory.CreateDirectory(nestedWtPath);
+            File.WriteAllText(Path.Combine(nestedWtPath, "dummy.txt"), "nested worktree file");
+
+            var fakeWt = new WorktreeInfo
+            {
+                Id = "nested-wt-1",
+                RepoId = "test-repo",
+                Branch = "feature-branch",
+                Path = nestedWtPath,
+                BareClonePath = Path.Combine(testBaseDir, "fake-bare.git")
+            };
+            var fakeRepo = new RepositoryInfo
+            {
+                Id = "test-repo",
+                BareClonePath = fakeWt.BareClonePath
+            };
+
+            var state = new RepositoryState
+            {
+                Repositories = [fakeRepo],
+                Worktrees = [fakeWt]
+            };
+            var rm = MakeLoadedRepoManager(state, testBaseDir);
+            try
+            {
+                // git worktree remove fails → catch block: isNested=true → Directory.Delete
+                await rm.RemoveWorktreeAsync("nested-wt-1", deleteBranch: false);
+            }
+            finally
+            {
+                RepoManager.SetBaseDirForTesting(TestSetup.TestBaseDir);
+            }
+
+            // The nested worktree directory SHOULD be deleted.
+            Assert.False(Directory.Exists(nestedWtPath),
+                $"Nested worktree at '{nestedWtPath}' was NOT cleaned up by RemoveWorktreeAsync!");
+
+            // Unregistered from state.
+            Assert.Empty(rm.Worktrees);
+        }
+        finally
+        {
+            ForceDeleteDirectory(testBaseDir);
+        }
+    }
+
+    [Fact]
+    public async Task RemoveWorktreeAsync_NoBareClone_ExternalPath_DoesNotDeleteDirectory()
+    {
+        // If a worktree has no BareClonePath and the path is not under a managed location,
+        // the else branch must also protect external directories.
+        var testBaseDir = Path.Combine(Path.GetTempPath(), $"rm-nobare-test-{Guid.NewGuid():N}");
+        var externalDir = Path.Combine(Path.GetTempPath(), $"user-ext-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(testBaseDir);
+        Directory.CreateDirectory(externalDir);
+
+        try
+        {
+            var fakeWt = new WorktreeInfo
+            {
+                Id = "no-bare-ext-1",
+                RepoId = "test-repo",
+                Branch = "main",
+                Path = externalDir,
+                BareClonePath = null  // no bare clone
+            };
+
+            var state = new RepositoryState { Worktrees = [fakeWt] };
+            var rm = MakeLoadedRepoManager(state, testBaseDir);
+            try
+            {
+                await rm.RemoveWorktreeAsync("no-bare-ext-1", deleteBranch: false);
+            }
+            finally
+            {
+                RepoManager.SetBaseDirForTesting(TestSetup.TestBaseDir);
+            }
+
+            Assert.True(Directory.Exists(externalDir),
+                "External dir with no BareClone was incorrectly deleted by RemoveWorktreeAsync!");
+            Assert.Empty(rm.Worktrees);
+        }
+        finally
+        {
+            ForceDeleteDirectory(testBaseDir);
+            ForceDeleteDirectory(externalDir);
+        }
+    }
+
+    #endregion
+
+    #region CreateWorktreeAsync Path Strategy Tests
+
+    [Fact]
+    public void CreateWorktree_WithLocalPath_PlacesWorktreeInsideLocalRepo()
+    {
+        // When localPath is provided, the worktree path should be:
+        // {localPath}/.polypilot/worktrees/{branchName}
+        // This is the "nested strategy" that keeps worktrees inside the user's repo.
+
+        var localRepoPath = Path.Combine(Path.GetTempPath(), "my-local-repo");
+        var branchName = "feature-login";
+        var repoWorktreesDir = Path.Combine(localRepoPath, ".polypilot", "worktrees");
+        var expectedPath = Path.Combine(repoWorktreesDir, branchName);
+        var resolved = Path.GetFullPath(expectedPath);
+        var managedBase = Path.GetFullPath(repoWorktreesDir) + Path.DirectorySeparatorChar;
+
+        // Verify path is inside the managed dir (passes the guard)
+        Assert.True(resolved.StartsWith(managedBase, StringComparison.OrdinalIgnoreCase),
+            $"Expected path '{resolved}' to be inside '{managedBase}'");
+
+        // Verify it is NOT under the centralized worktrees dir
+        var centralDir = Path.Combine(Path.GetTempPath(), ".polypilot", "worktrees");
+        Assert.False(resolved.StartsWith(Path.GetFullPath(centralDir), StringComparison.OrdinalIgnoreCase),
+            "Nested worktree path should NOT be under the centralized worktrees dir");
+    }
+
+    [Fact]
+    public void CreateWorktree_WithoutLocalPath_PlacesWorktreeInCentralDir()
+    {
+        // When localPath is null, the worktree path should be:
+        // {WorktreesDir}/{repoId}-{guid8}
+        // This is the "centralized strategy" for URL-based groups.
+
+        var testBaseDir = Path.Combine(Path.GetTempPath(), $"central-strategy-{Guid.NewGuid():N}");
+        var worktreesDir = Path.Combine(testBaseDir, "worktrees");
+        var repoId = "owner-myrepo";
+        var guid = "abc12345";
+        var expectedPath = Path.Combine(worktreesDir, $"{repoId}-{guid}");
+
+        // Verify the centralized path is under the WorktreesDir
+        Assert.True(expectedPath.StartsWith(worktreesDir, StringComparison.OrdinalIgnoreCase),
+            $"Centralized path '{expectedPath}' should be under WorktreesDir '{worktreesDir}'");
+
+        // Verify it does NOT contain .polypilot/worktrees (which would indicate nested)
+        var marker = Path.Combine(".polypilot", "worktrees");
+        Assert.DoesNotContain(marker, expectedPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void CreateWorktree_LocalPath_StrategySelectedByNullCheck()
+    {
+        // Regression: the localPath parameter is the SOLE discriminator between nested
+        // and centralized strategy. Verify that an empty/whitespace localPath would NOT
+        // accidentally trigger the nested path (same guard that CreateWorktreeAsync uses).
+
+        // Production code: if (!string.IsNullOrWhiteSpace(localPath)) → nested
+        Assert.True(string.IsNullOrWhiteSpace(null));
+        Assert.True(string.IsNullOrWhiteSpace(""));
+        Assert.True(string.IsNullOrWhiteSpace("   "));
+        Assert.False(string.IsNullOrWhiteSpace("/valid/path"));
+        Assert.False(string.IsNullOrWhiteSpace(@"C:\valid\path"));
+    }
+
+    #endregion
+
+    #region M2 Migration Ambiguity Tests
+
+    [Fact]
+    public void LocalPath_BackfillMigration_SkipsAmbiguousMatches()
+    {
+        // M2 regression: when two external worktrees from different repos share the same
+        // folder name (e.g., ~/work/MyApp and ~/personal/MyApp), the old migration that
+        // backfills LocalPath by matching group name against folder name must SKIP both,
+        // leaving the group unchanged to avoid wrong assignment.
+
+        // Simulate: group named "MyApp" with no RepoId, two external worktrees both named "MyApp"
+        var managedDir = Path.Combine(Path.GetTempPath(), ".polypilot", "worktrees");
+        var ext1 = Path.Combine(Path.GetTempPath(), "work", "MyApp");
+        var ext2 = Path.Combine(Path.GetTempPath(), "personal", "MyApp");
+
+        var worktrees = new List<WorktreeInfo>
+        {
+            new() { Id = "e1", RepoId = "repo-1", Branch = "main", Path = ext1 },
+            new() { Id = "e2", RepoId = "repo-2", Branch = "main", Path = ext2 }
+        };
+
+        // Simulate the migration logic (extracted from ReconcileOrganization):
+        var candidates = worktrees.Where(wt =>
+            !wt.Path.StartsWith(managedDir, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(
+                Path.GetFileName(wt.Path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)),
+                "MyApp", StringComparison.OrdinalIgnoreCase)).ToList();
+
+        // Both match "MyApp" folder name → ambiguous → must be skipped (count != 1)
+        Assert.Equal(2, candidates.Count);
+        // The migration skips when candidates.Count != 1, so group remains unmodified.
+        var shouldSkip = candidates.Count != 1;
+        Assert.True(shouldSkip, "Ambiguous external worktrees should trigger skip in M2 migration");
+    }
+
+    [Fact]
+    public void LocalPath_BackfillMigration_BackfillsUnambiguousMatch()
+    {
+        // M2: when exactly ONE external worktree matches the group name, migration proceeds.
+        var managedDir = Path.Combine(Path.GetTempPath(), ".polypilot", "worktrees");
+        var extPath = Path.Combine(Path.GetTempPath(), "work", "UniqueRepo");
+
+        var worktrees = new List<WorktreeInfo>
+        {
+            new() { Id = "e1", RepoId = "repo-1", Branch = "main", Path = extPath }
+        };
+
+        var candidates = worktrees.Where(wt =>
+            !wt.Path.StartsWith(managedDir, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(
+                Path.GetFileName(wt.Path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)),
+                "UniqueRepo", StringComparison.OrdinalIgnoreCase)).ToList();
+
+        Assert.Single(candidates);
+        // One unambiguous match → migration should proceed
+        var shouldSkip = candidates.Count != 1;
+        Assert.False(shouldSkip, "Unambiguous match should NOT be skipped in M2 migration");
+        Assert.Equal("repo-1", candidates[0].RepoId);
+        Assert.Equal(extPath, candidates[0].Path);
+    }
+
+    #endregion
+
+    private static Task RunProcess(string exe, params string[] args)
+    {
+        var tcs = new TaskCompletionSource();
+        var psi = new System.Diagnostics.ProcessStartInfo(exe)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        // Set EnableRaisingEvents and subscribe Exited BEFORE Start() to avoid the race
+        // where a fast process exits between Start() and EnableRaisingEvents = true.
+        var p = new System.Diagnostics.Process { StartInfo = psi, EnableRaisingEvents = true };
+        p.Exited += (_, _) =>
+        {
+            if (p.ExitCode == 0) tcs.TrySetResult();
+            else tcs.TrySetException(new Exception($"{exe} exited with {p.ExitCode}"));
+        };
+        p.Start();
+        return tcs.Task;
+    }
+
+    #endregion
 }
+

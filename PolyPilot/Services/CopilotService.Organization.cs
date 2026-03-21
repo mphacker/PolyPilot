@@ -507,13 +507,18 @@ public partial class CopilotService
                         meta.WorktreeId = worktree.Id;
                         _repoManager.LinkSessionToWorktree(worktree.Id, name);
                         
-                        // Move session to repo's group
-                        var repo = _repoManager.Repositories.FirstOrDefault(r => r.Id == worktree.RepoId);
-                        if (repo != null)
+                        // Move session to repo's group — but skip if the session is already
+                        // in a local folder group (those sessions stay in their local folder group).
+                        var currentGroup = Organization.Groups.FirstOrDefault(g => g.Id == meta.GroupId);
+                        if (currentGroup?.IsLocalFolder != true)
                         {
-                            var repoGroup = GetOrCreateRepoGroup(repo.Id, repo.Name);
-                            if (repoGroup != null)
-                                meta.GroupId = repoGroup.Id;
+                            var repo = _repoManager.Repositories.FirstOrDefault(r => r.Id == worktree.RepoId);
+                            if (repo != null)
+                            {
+                                var repoGroup = GetOrCreateRepoGroup(repo.Id, repo.Name);
+                                if (repoGroup != null)
+                                    meta.GroupId = repoGroup.Id;
+                            }
                         }
                         changed = true;
                     }
@@ -562,6 +567,76 @@ public partial class CopilotService
             {
                 if (GetOrCreateRepoGroup(repo.Id, repo.Name) != null)
                     changed = true;
+            }
+        }
+
+        // Migration: back-fill LocalPath/RepoId on groups that were created by an older version
+        // of the code before the LocalPath field existed. Detect them by matching their name against
+        // registered external worktrees (paths NOT under the managed worktrees directory).
+        // Only back-fill when exactly one worktree matches — if multiple external worktrees share
+        // the same folder name (e.g., ~/projects/myapp and ~/work/myapp), the match is ambiguous
+        // and we leave the group alone rather than risk assigning the wrong repo.
+        var managedWorktreesDir = _repoManager.GetWorktreesDir();
+        foreach (var group in Organization.Groups)
+        {
+            if (group.IsLocalFolder || !string.IsNullOrEmpty(group.RepoId) || group.IsMultiAgent
+                || group.Id == SessionGroup.DefaultId || group.IsCodespace)
+                continue;
+
+            // Collect all external worktrees whose folder name matches this group name
+            var candidates = _repoManager.Worktrees.Where(wt =>
+                !wt.Path.StartsWith(managedWorktreesDir, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(Path.GetFileName(wt.Path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)),
+                    group.Name, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            // Skip if ambiguous (multiple repos share the same folder name)
+            if (candidates.Count != 1)
+                continue;
+
+            var match = candidates[0];
+            group.LocalPath = match.Path;
+            group.RepoId = match.RepoId;
+            changed = true;
+            Debug($"ReconcileOrganization: back-filled LocalPath='{match.Path}' RepoId='{match.RepoId}' on group '{group.Name}'");
+        }
+
+        // Migration: ensure that repos with registered external worktrees (user-added local
+        // folders) have a corresponding 📁 local folder group. An external worktree is any
+        // worktree whose path is NOT under the managed worktrees directory AND does NOT contain
+        // ".polypilot/worktrees" (which marks nested worktrees inside local folders).
+        // When a local folder group is missing, promote the most-recently-created URL-based
+        // group for that repo to a local folder group rather than creating a duplicate.
+        var sep = Path.DirectorySeparatorChar;
+        var polypilotWorktreesMarker = $".polypilot{sep}worktrees";
+        var externalWorktrees = _repoManager.Worktrees.Where(wt =>
+            !wt.Path.StartsWith(managedWorktreesDir, StringComparison.OrdinalIgnoreCase) &&
+            wt.Path.IndexOf(polypilotWorktreesMarker, StringComparison.OrdinalIgnoreCase) < 0).ToList();
+
+        foreach (var ext in externalWorktrees)
+        {
+            var normalizedExtPath = Path.GetFullPath(ext.Path)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+            // Already have a local folder group for this exact path?
+            var hasLocalGroup = Organization.Groups.Any(g =>
+                g.IsLocalFolder && !g.IsMultiAgent && g.LocalPath != null &&
+                string.Equals(
+                    Path.GetFullPath(g.LocalPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    normalizedExtPath, StringComparison.OrdinalIgnoreCase));
+            if (hasLocalGroup) continue;
+
+            // Promote the most-recently-added URL-based group for this repo.
+            var groupToPromote = Organization.Groups
+                .Where(g => g.RepoId == ext.RepoId && !g.IsLocalFolder && !g.IsMultiAgent)
+                .OrderByDescending(g => g.SortOrder)
+                .FirstOrDefault();
+
+            if (groupToPromote != null)
+            {
+                groupToPromote.LocalPath = normalizedExtPath;
+                groupToPromote.Name = Path.GetFileName(normalizedExtPath);
+                changed = true;
+                Debug($"ReconcileOrganization: promoted group '{groupToPromote.Id}' to local folder group for '{normalizedExtPath}'");
             }
         }
 
@@ -978,9 +1053,11 @@ public partial class CopilotService
     {
         // Skip multi-agent groups — they have a RepoId for worktree context but are
         // not the "repo group" that regular sessions should auto-join.
+        // Also skip local folder groups — they are a separate concept from URL-based repo groups,
+        // and coexist with them when the same repo is added both ways.
         // Also skip groups that have orchestrator/worker sessions (defensive: protects against
         // IsMultiAgent being lost due to stale writes or serialization issues).
-        var existing = Organization.Groups.FirstOrDefault(g => g.RepoId == repoId && !g.IsMultiAgent
+        var existing = Organization.Groups.FirstOrDefault(g => g.RepoId == repoId && !g.IsMultiAgent && !g.IsLocalFolder
             && !Organization.Sessions.Any(m => m.GroupId == g.Id && m.Role == MultiAgentRole.Orchestrator));
         if (existing != null) return existing;
 
@@ -1004,9 +1081,102 @@ public partial class CopilotService
         return group;
     }
 
-    #endregion
+    /// <summary>
+    /// Create (or return existing) a sidebar group for a pinned local folder.
+    /// The group is distinct from any repo-based group — sessions in it use the local path as CWD.
+    /// When <paramref name="repoId"/> is provided, the group records which repo backs it so the
+    /// full worktree/branch menu can be offered.
+    /// </summary>
+    public SessionGroup GetOrCreateLocalFolderGroup(string localPath, string? repoId = null)
+    {
+        var normalized = Path.GetFullPath(localPath)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
-    #region Multi-Agent Orchestration
+        var existing = Organization.Groups.FirstOrDefault(g =>
+            g.IsLocalFolder &&
+            !g.IsMultiAgent &&
+            string.Equals(
+                Path.GetFullPath(g.LocalPath!).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                normalized,
+                StringComparison.OrdinalIgnoreCase));
+        if (existing != null)
+        {
+            bool changed = false;
+            if (existing.IsCollapsed) { existing.IsCollapsed = false; changed = true; }
+            // Back-fill RepoId if we now know it
+            if (repoId != null && existing.RepoId == null) { existing.RepoId = repoId; changed = true; }
+            if (changed) { SaveOrganization(); OnStateChanged?.Invoke(); }
+            return existing;
+        }
+
+        var folderName = Path.GetFileName(normalized);
+        var group = new SessionGroup
+        {
+            Id = Guid.NewGuid().ToString(),
+            Name = folderName,
+            LocalPath = normalized,
+            RepoId = repoId,
+            SortOrder = Organization.Groups.Any() ? Organization.Groups.Max(g => g.SortOrder) + 1 : 0
+        };
+        AddGroup(group);
+        SaveOrganization();
+        OnStateChanged?.Invoke();
+        return group;
+    }
+
+    /// <summary>
+    /// Ensures a 📁 local folder group exists for <paramref name="localPath"/>.
+    /// Unlike <see cref="GetOrCreateLocalFolderGroup"/>, this first tries to <em>promote</em>
+    /// an existing URL-based group for the same repo to a local folder group (by setting its
+    /// <see cref="SessionGroup.LocalPath"/>). This preserves session history when the group was
+    /// created by an older version of the code that lacked local-folder support.
+    /// Falls back to <see cref="GetOrCreateLocalFolderGroup"/> if no promotable group is found.
+    /// </summary>
+    public SessionGroup PromoteOrCreateLocalFolderGroup(string localPath, string? repoId = null)
+    {
+        var normalized = Path.GetFullPath(localPath)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        // If a local folder group already exists for this exact path, just update it.
+        var alreadyLocal = Organization.Groups.FirstOrDefault(g =>
+            g.IsLocalFolder && !g.IsMultiAgent &&
+            string.Equals(
+                Path.GetFullPath(g.LocalPath!).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                normalized, StringComparison.OrdinalIgnoreCase));
+        if (alreadyLocal != null)
+        {
+            bool changed = false;
+            if (alreadyLocal.IsCollapsed) { alreadyLocal.IsCollapsed = false; changed = true; }
+            if (repoId != null && alreadyLocal.RepoId == null) { alreadyLocal.RepoId = repoId; changed = true; }
+            if (changed) { SaveOrganization(); OnStateChanged?.Invoke(); }
+            return alreadyLocal;
+        }
+
+        // Look for an existing URL-based group for this repo to promote in-place.
+        // Pick the most recently created (highest SortOrder) non-multi-agent group.
+        // This handles migration from older code versions that created URL-based groups
+        // instead of local folder groups when the user added an existing folder.
+        if (repoId != null)
+        {
+            var candidate = Organization.Groups
+                .Where(g => g.RepoId == repoId && !g.IsLocalFolder && !g.IsMultiAgent)
+                .OrderByDescending(g => g.SortOrder)
+                .FirstOrDefault();
+            if (candidate != null)
+            {
+                candidate.LocalPath = normalized;
+                candidate.Name = Path.GetFileName(normalized);
+                SaveOrganization();
+                OnStateChanged?.Invoke();
+                Debug($"PromoteOrCreateLocalFolderGroup: promoted '{candidate.Id}' to local folder group for '{normalized}'");
+                return candidate;
+            }
+        }
+
+        // No existing group to promote — create a fresh local folder group.
+        return GetOrCreateLocalFolderGroup(localPath, repoId);
+    }
+
 
     /// <summary>
     /// Create a multi-agent group and optionally move existing sessions into it.
@@ -2408,7 +2578,7 @@ public partial class CopilotService
                 // Dead event stream fallback: in-memory history may be empty if the SDK event
                 // callback stopped firing. Try reading events.jsonl directly from disk.
                 string? diskResponse = null;
-                if (!session.IsProcessing)
+                if (!session.IsProcessing && !string.IsNullOrEmpty(session.SessionId))
                 {
                     try
                     {

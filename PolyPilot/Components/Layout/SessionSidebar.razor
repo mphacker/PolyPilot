@@ -345,7 +345,7 @@ else
                 <div class="toolbar-actions">
                     <button class="new-group-btn" @onclick="StartAddGroup" title="New group">+ Group</button>
                     <button class="new-group-btn" @onclick="StartAddMultiAgentGroup" title="New multi-agent group">🤖 Multi</button>
-                    <button class="new-group-btn" @onclick="() => showAddRepo = true" title="Add repository">+ Repo</button>
+                    <button class="new-group-btn" @onclick="OpenAddRepoForm" title="Add repository">+ Repo</button>
                     <button class="new-group-btn" @onclick="RefreshSessionsManually" title="Refresh sessions">↻</button>
                 </div>
             }
@@ -357,25 +357,74 @@ else
         @if (showAddRepo)
         {
             <div class="add-repo-form">
-                <input type="text" @bind="newRepoUrl" placeholder="owner/repo or full URL" class="repo-url-input" />
-                @if (confirmRepoReplace)
+                @* Mode tabs: URL vs Existing Folder *@
+                @if (PlatformHelper.IsDesktop && !confirmRepoReplace)
                 {
-                    <div class="repo-confirm">
-                        <span>@confirmRepoName already exists. Re-fetch?</span>
-                        <div class="repo-confirm-actions">
-                            <button class="btn-repo-add" @onclick="ConfirmAddRepository">Yes</button>
-                            <button class="btn-repo-cancel" @onclick="() => { confirmRepoReplace = false; confirmRepoName = null; }">No</button>
-                        </div>
+                    <div class="add-repo-mode-tabs">
+                        <button class="add-repo-tab @(addRepoFolderMode ? "" : "active")"
+                                @onclick="() => { addRepoFolderMode = false; addRepoError = null; }">
+                            🔗 URL
+                        </button>
+                        <button class="add-repo-tab @(addRepoFolderMode ? "active" : "")"
+                                @onclick="() => { addRepoFolderMode = true; addRepoError = null; }">
+                            📂 Existing Folder
+                        </button>
                     </div>
+                }
+
+                @if (addRepoFolderMode && PlatformHelper.IsDesktop)
+                {
+                    @* Folder picker mode *@
+                    @if (addFolderMergedIntoGroupName != null)
+                    {
+                        <div class="repo-confirm">
+                            <span>✅ Registered as an existing worktree in the <strong>@addFolderMergedIntoGroupName</strong> group. Use its <strong>⋯ → New Session → 📂 Existing</strong> to open it.</span>
+                        </div>
+                        <div class="add-repo-actions">
+                            <button class="btn-repo-cancel" @onclick="CloseAddRepoForm">Close</button>
+                        </div>
+                    }
+                    else
+                    {
+                    <div class="add-repo-folder-row">
+                        <input type="text" @bind="addRepoFolderPath"
+                               placeholder="Path to a cloned repository…"
+                               class="repo-url-input" />
+                        <button class="btn-repo-browse" @onclick="BrowseExistingRepo"
+                                title="Pick a folder">…</button>
+                    </div>
+                    <div class="add-repo-actions">
+                        <button class="btn-repo-add"
+                                @onclick="AddRepositoryFromFolder"
+                                disabled="@(isAddingRepo || string.IsNullOrWhiteSpace(addRepoFolderPath))">
+                            @(isAddingRepo ? "Adding..." : "Add")
+                        </button>
+                        <button class="btn-repo-cancel" @onclick="CloseAddRepoForm">Cancel</button>
+                    </div>
+                    }
                 }
                 else
                 {
-                    <div class="add-repo-actions">
-                        <button class="btn-repo-add" @onclick="AddRepository" disabled="@(isAddingRepo || string.IsNullOrWhiteSpace(newRepoUrl))">
-                            @(isAddingRepo ? "Cloning..." : "Add")
-                        </button>
-                        <button class="btn-repo-cancel" @onclick="() => { showAddRepo = false; addRepoError = null; }">Cancel</button>
-                    </div>
+                    <input type="text" @bind="newRepoUrl" placeholder="owner/repo or full URL" class="repo-url-input" />
+                    @if (confirmRepoReplace)
+                    {
+                        <div class="repo-confirm">
+                            <span>@confirmRepoName already exists. Re-fetch?</span>
+                            <div class="repo-confirm-actions">
+                                <button class="btn-repo-add" @onclick="ConfirmAddRepository">Yes</button>
+                                <button class="btn-repo-cancel" @onclick="() => { confirmRepoReplace = false; confirmRepoName = null; }">No</button>
+                            </div>
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="add-repo-actions">
+                            <button class="btn-repo-add" @onclick="AddRepository" disabled="@(isAddingRepo || string.IsNullOrWhiteSpace(newRepoUrl))">
+                                @(isAddingRepo ? "Cloning..." : "Add")
+                            </button>
+                            <button class="btn-repo-cancel" @onclick="CloseAddRepoForm">Cancel</button>
+                        </div>
+                    }
                 }
                 @if (isAddingRepo && !string.IsNullOrEmpty(addRepoProgress))
                 {
@@ -416,14 +465,16 @@ else
                     @if (showGroupHeaders)
                     {
                         var isRepoGroup = !string.IsNullOrEmpty(group.RepoId);
+                        var isLocalFolderGroup = group.IsLocalFolder;
                         var repoForGroup = isRepoGroup ? RepoManager.Repositories.FirstOrDefault(r => r.Id == group.RepoId) : null;
                         var groupTitle = repoForGroup != null ? $"{repoForGroup.Url}\n{repoForGroup.BareClonePath}" : "";
+                        if (isLocalFolderGroup) groupTitle = group.LocalPath!;
                         var repoDiskSize = repoForGroup != null ? RepoManager.GetRepoDiskSize(repoForGroup.Id) : null;
                         if (repoDiskSize.HasValue)
                             groupTitle += $"\nDisk: {RepoManager.FormatSize(repoDiskSize.Value)}";
                         if (groupProvider != null)
                             groupTitle = groupProvider.GroupDescription;
-                        <div class="group-header @(group.IsCollapsed ? "collapsed" : "") @(isRepoGroup ? "repo-group" : "") @(groupProvider != null ? "provider-group" : "")"
+                        <div class="group-header @(group.IsCollapsed ? "collapsed" : "") @(isRepoGroup || isLocalFolderGroup ? "repo-group" : "") @(groupProvider != null ? "provider-group" : "")"
                              title="@groupTitle"
                              style="@(groupProvider != null ? $"border-left-color: {groupProvider.AccentColor};" : "")"
                              @onclick="() => CopilotService.ToggleGroupCollapsed(group.Id)">
@@ -431,6 +482,10 @@ else
                             @if (groupProvider != null)
                             {
                                 <span class="group-repo-icon" title="@groupProvider.DisplayName">@groupProvider.Icon</span>
+                            }
+                            else if (isLocalFolderGroup)
+                            {
+                                <span class="group-repo-icon" title="Local folder">📁</span>
                             }
                             else if (isRepoGroup)
                             {
@@ -494,7 +549,33 @@ else
                                         {
                                             <div class="group-menu-overlay" @onclick="() => { openGroupMenuId = null; }" @onclick:stopPropagation="true"></div>
                                             <div class="group-menu" @onclick:stopPropagation="true">
-                                                @if (isRepoGroup)
+                                                @if (isLocalFolderGroup)
+                                                {
+                                                    var localFolderPath = group.LocalPath!;
+                                                    <button class="group-menu-item" @onclick="() => { openGroupMenuId = null; QuickCreateSessionForFolder(gId, localFolderPath); }">
+                                                        ➕ New Session Here
+                                                    </button>
+                                                    @if (!string.IsNullOrEmpty(group.RepoId))
+                                                    {
+                                                        @* 📁 group backed by a bare clone — offer full branch/worktree features *@
+                                                        var lfRepoId = group.RepoId!;
+                                                        var lfLocalPath = group.LocalPath!;
+                                                        <button class="group-menu-item" @onclick="() => { openGroupMenuId = null; QuickCreateSessionForRepo(lfRepoId, gId, lfLocalPath); }">
+                                                            ⚡ Quick Branch + Session
+                                                        </button>
+                                                        <button class="group-menu-item" @onclick="() => { openGroupMenuId = null; StartQuickBranch(lfRepoId, gId, lfLocalPath); }">
+                                                            ⑂ Named Branch + Session
+                                                        </button>
+                                                    }
+                                                    <button class="group-menu-item" @onclick="() => { openGroupMenuId = null; StartGroupRename(gId); }">
+                                                        ✏️ Rename
+                                                    </button>
+                                                    <div class="group-menu-separator"></div>
+                                                    <button class="group-menu-item destructive" @onclick="() => { openGroupMenuId = null; CopilotService.DeleteGroup(gId); }">
+                                                        🗑 Remove Folder
+                                                    </button>
+                                                }
+                                                else @if (isRepoGroup)
                                                 {
                                                     var rId = group.RepoId!;
                                                     <button class="group-menu-item" @onclick="() => { openGroupMenuId = null; createSessionFormRef?.ExpandForRepo(rId); }">
@@ -546,7 +627,7 @@ else
                             }
                         </div>
 
-                        @if (quickBranchRepoId == group.RepoId && isRepoGroup)
+                        @if (quickBranchRepoId == group.RepoId && (isRepoGroup || isLocalFolderGroup))
                         {
                             var qbRepoId = group.RepoId!;
                             <div class="quick-branch-input-bar" @onclick:stopPropagation="true">
@@ -1243,9 +1324,16 @@ else
     private bool confirmRepoReplace = false;
     private string? confirmRepoName = null;
     private string? confirmRemoveRepoId = null;
+    // true when the user chose "Browse folder" mode instead of typing a URL
+    private bool addRepoFolderMode = false;
+    private string addRepoFolderPath = "";
+    // When a local folder is merged into an existing repo group instead of getting its own 📁 group
+    private string? addFolderMergedIntoGroupName = null;
 
     // Quick-create inline branch input
     private string? quickBranchRepoId = null;
+    private string? quickBranchGroupId = null;
+    private string? quickBranchLocalPath = null;
     private string quickBranchInput = "";
     private bool quickBranchIsCreating = false;
     private string? quickBranchError = null;
@@ -1758,7 +1846,32 @@ else
         }
     }
 
-    private async Task QuickCreateSessionForRepo(string repoId)
+    private async Task QuickCreateSessionForFolder(string groupId, string localPath)
+    {
+        if (isCreating) return;
+        isCreating = true;
+        createError = null;
+        try
+        {
+            var folderName = Path.GetFileName(localPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            var sessionName = $"{folderName}-{DateTime.Now:yyyyMMdd-HHmmss}";
+            var sessionInfo = await CopilotService.CreateSessionAsync(sessionName, selectedModel, workingDirectory: localPath, groupId: groupId);
+            CopilotService.SwitchSession(sessionInfo.Name);
+            CopilotService.SaveUiState(currentPage, selectedModel: selectedModel);
+            await OnSessionSelected.InvokeAsync();
+        }
+        catch (Exception ex)
+        {
+            createError = ex.Message;
+            Console.WriteLine($"Error creating session for folder: {ex}");
+        }
+        finally
+        {
+            isCreating = false;
+        }
+    }
+
+    private async Task QuickCreateSessionForRepo(string repoId, string? targetGroupId = null, string? localPath = null)
     {
         if (isCreating) return;
         isCreating = true;
@@ -1769,7 +1882,9 @@ else
         {
             var sessionInfo = await CopilotService.CreateSessionWithWorktreeAsync(
                 repoId: repoId,
-                model: selectedModel);
+                model: selectedModel,
+                targetGroupId: targetGroupId,
+                localPath: localPath);
             CopilotService.SaveUiState(currentPage, selectedModel: selectedModel);
             await OnSessionSelected.InvokeAsync();
         }
@@ -1786,9 +1901,11 @@ else
         }
     }
 
-    private void StartQuickBranch(string repoId)
+    private void StartQuickBranch(string repoId, string? targetGroupId = null, string? localPath = null)
     {
         quickBranchRepoId = repoId;
+        quickBranchGroupId = targetGroupId;
+        quickBranchLocalPath = localPath;
         quickBranchInput = "";
         quickBranchError = null;
     }
@@ -1796,7 +1913,7 @@ else
     private async Task HandleQuickBranchKeyDown(KeyboardEventArgs e, string repoId)
     {
         if (e.Key == "Enter") await CommitQuickBranch(repoId);
-        else if (e.Key == "Escape") quickBranchRepoId = null;
+        else if (e.Key == "Escape") { quickBranchRepoId = null; quickBranchLocalPath = null; }
     }
 
     private async Task CommitQuickBranch(string repoId)
@@ -1820,15 +1937,26 @@ else
                 return;
             }
             else
+            {
                 branchName = System.Text.RegularExpressions.Regex.Replace(input, @"[^a-zA-Z0-9/_.-]", "-").Trim('-');
+                if (string.IsNullOrEmpty(branchName))
+                {
+                    quickBranchError = "Branch name cannot be empty after sanitization.";
+                    return;
+                }
+            }
 
             await CopilotService.CreateSessionWithWorktreeAsync(
                 repoId: repoId,
                 branchName: branchName,
                 prNumber: prNumber,
-                model: selectedModel);
+                model: selectedModel,
+                targetGroupId: quickBranchGroupId,
+                localPath: quickBranchLocalPath);
 
             quickBranchRepoId = null;
+            quickBranchGroupId = null;
+            quickBranchLocalPath = null;
             quickBranchInput = "";
             CopilotService.SaveUiState(currentPage, selectedModel: selectedModel);
             await OnSessionSelected.InvokeAsync();
@@ -2470,6 +2598,83 @@ else
         catch (Exception ex)
         {
             Console.WriteLine($"Error removing repo: {ex.Message}");
+        }
+    }
+
+    private void OpenAddRepoForm()
+    {
+        showAddRepo = true;
+        addRepoFolderMode = false;
+        addRepoFolderPath = "";
+        addRepoError = null;
+        confirmRepoReplace = false;
+        confirmRepoName = null;
+        newRepoUrl = "";
+    }
+
+    private void CloseAddRepoForm()
+    {
+        showAddRepo = false;
+        addRepoError = null;
+        addRepoFolderMode = false;
+        addRepoFolderPath = "";
+        addFolderMergedIntoGroupName = null;
+        newRepoUrl = "";
+    }
+
+    private async Task BrowseExistingRepo()
+    {
+#if MACCATALYST || WINDOWS
+        try
+        {
+            var dir = await FolderPickerService.PickFolderAsync();
+            if (!string.IsNullOrEmpty(dir))
+            {
+                addRepoFolderPath = dir;
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            addRepoError = $"Could not open folder picker: {ex.Message}";
+        }
+#else
+        await Task.CompletedTask;
+#endif
+    }
+
+    private async Task AddRepositoryFromFolder()
+    {
+        if (isAddingRepo || string.IsNullOrWhiteSpace(addRepoFolderPath)) return;
+        addRepoError = null;
+        addFolderMergedIntoGroupName = null;
+        isAddingRepo = true;
+        addRepoProgress = null;
+        try
+        {
+            var result = await CopilotService.AddRepoFromLocalFolderAsync(addRepoFolderPath.Trim(), progress =>
+            {
+                addRepoProgress = progress;
+                InvokeAsync(StateHasChanged);
+            });
+            if (result.ExistingGroupId != null)
+            {
+                // Merged into an existing repo group — show guidance instead of closing
+                addFolderMergedIntoGroupName = result.ExistingGroupName;
+            }
+            else
+            {
+                CloseAddRepoForm();
+            }
+        }
+        catch (Exception ex)
+        {
+            addRepoError = ex.Message;
+        }
+        finally
+        {
+            isAddingRepo = false;
+            addRepoProgress = null;
         }
     }
 

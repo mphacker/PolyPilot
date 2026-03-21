@@ -20,6 +20,9 @@ public class RepoManager
     private string ReposDir => Path.Combine(GetCachedStorageRoot(), "repos");
     private string WorktreesDir => Path.Combine(GetCachedStorageRoot(), "worktrees");
 
+    /// <summary>Returns the directory where PolyPilot-managed worktrees live.</summary>
+    public string GetWorktreesDir() => WorktreesDir;
+
     /// <summary>
     /// Redirect all RepoManager paths to a test directory.
     /// Clears cached paths so they re-resolve from the new base.
@@ -528,22 +531,144 @@ public class RepoManager
     }
 
     /// <summary>
-    /// Add a repository from an existing local path (non-bare). Creates a bare clone.
+    /// Add a repository from an existing local path (non-bare). Validates the folder is a
+    /// git repository with an 'origin' remote, then registers and bare-clones it the same
+    /// way as <see cref="AddRepositoryAsync(string,Action{string}?,CancellationToken)"/>.
+    /// The local folder is also registered as an external worktree so it appears in the
+    /// "📂 Existing" list when creating sessions.
     /// </summary>
-    public async Task<RepositoryInfo> AddRepositoryFromLocalAsync(string localPath, CancellationToken ct = default)
+    /// <param name="localPath">Path to an existing non-bare git working directory.</param>
+    /// <param name="onProgress">Optional progress callback forwarded to the clone/fetch step.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<RepositoryInfo> AddRepositoryFromLocalAsync(
+        string localPath,
+        Action<string>? onProgress = null,
+        CancellationToken ct = default)
     {
-        // Get remote URL
-        var remoteUrl = (await RunGitAsync(localPath, ct, "remote", "get-url", "origin")).Trim();
-        if (string.IsNullOrEmpty(remoteUrl))
-            throw new InvalidOperationException($"No 'origin' remote found in {localPath}");
+        // Expand ~ so users can type ~/Projects/myrepo without hitting Directory.Exists failures.
+        if (localPath.StartsWith("~", StringComparison.Ordinal))
+            localPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                localPath.TrimStart('~').TrimStart('/', '\\'));
+        localPath = Path.GetFullPath(localPath);
 
-        return await AddRepositoryAsync(remoteUrl, ct);
+        if (!Directory.Exists(localPath))
+            throw new InvalidOperationException($"Folder not found: '{localPath}'");
+
+        // Confirm the folder is a git repository.
+        if (!await IsGitRepositoryAsync(localPath, ct))
+            throw new InvalidOperationException(
+                $"'{localPath}' is not a git repository. " +
+                "Make sure the folder contains a cloned repository.");
+
+        // Extract the remote URL from the 'origin' remote.
+        string remoteUrl;
+        try
+        {
+            remoteUrl = (await RunGitAsync(localPath, ct, "remote", "get-url", "origin")).Trim();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            remoteUrl = "";
+        }
+
+        if (string.IsNullOrEmpty(remoteUrl))
+            throw new InvalidOperationException(
+                $"No 'origin' remote found in '{localPath}'. " +
+                "The folder must have a remote named 'origin' (e.g. a GitHub clone).");
+
+        var repo = await AddRepositoryAsync(remoteUrl, onProgress, ct);
+
+        // Register the local folder as an external worktree so it also appears in the
+        // "📂 Existing" picker when creating repo-based sessions.
+        await RegisterExternalWorktreeAsync(repo, localPath, ct);
+
+        return repo;
+    }
+
+    /// <summary>
+    /// Register an existing local folder as a worktree for the given repo.
+    /// Idempotent — does nothing if the path is already registered.
+    /// </summary>
+    internal async Task RegisterExternalWorktreeAsync(RepositoryInfo repo, string localPath, CancellationToken ct)
+    {
+        EnsureLoaded();
+        var normalizedPath = Path.GetFullPath(localPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        // Already registered for this repo?
+        lock (_stateLock)
+        {
+            if (_state.Worktrees.Any(w => w.RepoId == repo.Id
+                && !string.IsNullOrWhiteSpace(w.Path)
+                && PathsEqual(w.Path, normalizedPath)))
+                return;
+        }
+
+        // Read the current branch of the local clone.
+        string branch;
+        try
+        {
+            branch = (await RunGitAsync(normalizedPath, ct, "branch", "--show-current")).Trim();
+            if (string.IsNullOrWhiteSpace(branch))
+            {
+                // Detached HEAD — use short commit hash as label
+                branch = (await RunGitAsync(normalizedPath, ct, "rev-parse", "--short", "HEAD")).Trim();
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { branch = Path.GetFileName(normalizedPath); }
+
+        var wt = new WorktreeInfo
+        {
+            RepoId = repo.Id,
+            Branch = branch,
+            Path = normalizedPath,
+            BareClonePath = repo.BareClonePath,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        lock (_stateLock)
+        {
+            // Re-check for duplicates under the lock to handle concurrent registrations (TOCTOU).
+            if (_state.Worktrees.Any(w => w.RepoId == repo.Id
+                && !string.IsNullOrWhiteSpace(w.Path)
+                && PathsEqual(w.Path, normalizedPath)))
+                return;
+            _state.Worktrees.Add(wt);
+            Save();
+        }
+        OnStateChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Returns true if <paramref name="path"/> is a git working directory or bare repository.
+    /// </summary>
+    private async Task<bool> IsGitRepositoryAsync(string path, CancellationToken ct)
+    {
+        try
+        {
+            var result = await RunGitAsync(path, ct, "rev-parse", "--git-dir");
+            return !string.IsNullOrWhiteSpace(result);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
     /// Create a new worktree for a repository on a new branch from origin/main.
     /// </summary>
-    public virtual async Task<WorktreeInfo> CreateWorktreeAsync(string repoId, string branchName, string? baseBranch = null, bool skipFetch = false, CancellationToken ct = default)
+    /// <param name="localPath">
+    /// Optional path to the user's existing local repo clone (added via "Add Existing Folder").
+    /// When provided, the worktree is created at <c>{localPath}/.polypilot/worktrees/{branchName}/</c>
+    /// (nested inside the user's repo) rather than the centralized <c>~/.polypilot/worktrees/</c>.
+    /// </param>
+    public virtual async Task<WorktreeInfo> CreateWorktreeAsync(string repoId, string branchName, string? baseBranch = null, bool skipFetch = false, string? localPath = null, CancellationToken ct = default)
     {
         EnsureLoaded();
         var repo = _state.Repositories.FirstOrDefault(r => r.Id == repoId)
@@ -562,9 +687,32 @@ public class RepoManager
         var baseRef = baseBranch ?? await GetDefaultBranch(repo.BareClonePath, ct);
         Console.WriteLine($"[RepoManager] Creating worktree from base ref: {baseRef}");
 
-        Directory.CreateDirectory(WorktreesDir);
+        string worktreePath;
         var worktreeId = Guid.NewGuid().ToString()[..8];
-        var worktreePath = Path.Combine(WorktreesDir, $"{repoId}-{worktreeId}");
+
+        if (!string.IsNullOrWhiteSpace(localPath))
+        {
+            // Nested strategy: place worktree inside the user's repo at .polypilot/worktrees/{branch}/
+            var repoWorktreesDir = Path.Combine(Path.GetFullPath(localPath), ".polypilot", "worktrees");
+            Directory.CreateDirectory(repoWorktreesDir);
+            EnsureGitIgnoreEntry(localPath, ".polypilot/");
+            worktreePath = Path.Combine(repoWorktreesDir, branchName);
+
+            // Guard against path traversal: branch names with ".." or leading "/" could escape
+            // the directory. Equality with repoWorktreesDir itself is also invalid — an empty
+            // branch name or a name that normalises to "." would trigger that case.
+            var resolved = Path.GetFullPath(worktreePath);
+            if (!resolved.StartsWith(Path.GetFullPath(repoWorktreesDir) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"Branch name '{branchName}' would create worktree outside the managed directory. " +
+                    "Use a branch name without '..' or leading path separators.");
+        }
+        else
+        {
+            // Centralized strategy: place worktree in ~/.polypilot/worktrees/{repoId}-{guid8}/
+            Directory.CreateDirectory(WorktreesDir);
+            worktreePath = Path.Combine(WorktreesDir, $"{repoId}-{worktreeId}");
+        }
 
         try
         {
@@ -595,6 +743,37 @@ public class RepoManager
         Save();
         OnStateChanged?.Invoke();
         return wt;
+    }
+
+    /// <summary>
+    /// Ensures that <paramref name="entry"/> (e.g. <c>.polypilot/</c>) is present in the
+    /// <c>.gitignore</c> file inside <paramref name="repoPath"/>. Creates <c>.gitignore</c>
+    /// if it does not exist. No-op if the entry is already present.
+    /// </summary>
+    private static void EnsureGitIgnoreEntry(string repoPath, string entry)
+    {
+        try
+        {
+            var gitignorePath = Path.Combine(repoPath, ".gitignore");
+            var lines = File.Exists(gitignorePath)
+                ? File.ReadAllLines(gitignorePath)
+                : [];
+
+            // Check if any existing line matches (exact or without trailing slash variant)
+            var entryTrimmed = entry.TrimEnd('/');
+            if (lines.Any(l => l.Trim() == entry || l.Trim() == entryTrimmed || l.Trim() == $"/{entry}" || l.Trim() == $"/{entryTrimmed}"))
+                return;
+
+            // Append with a leading newline if file doesn't end with one
+            using var sw = new StreamWriter(gitignorePath, append: true);
+            if (lines.Length > 0 && !string.IsNullOrEmpty(lines[^1]))
+                sw.WriteLine();
+            sw.WriteLine(entry);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RepoManager] Failed to update .gitignore: {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -724,8 +903,13 @@ public class RepoManager
             }
             catch
             {
-                // Force cleanup if git worktree remove fails
-                if (Directory.Exists(wt.Path))
+                // Force cleanup if git worktree remove fails — but only if the directory is
+                // inside a PolyPilot-managed location. External folders added via "Add Existing
+                // Folder" have BareClonePath set but must NEVER be deleted; only unregister them.
+                var fullPath = Path.GetFullPath(wt.Path);
+                var isCentralized = fullPath.StartsWith(Path.GetFullPath(WorktreesDir), StringComparison.OrdinalIgnoreCase);
+                var isNested = fullPath.Contains(Path.DirectorySeparatorChar + ".polypilot" + Path.DirectorySeparatorChar + "worktrees" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+                if ((isCentralized || isNested) && Directory.Exists(wt.Path))
                     try { Directory.Delete(wt.Path, recursive: true); } catch { }
                 try { await RunGitAsync(bareClonePath, ct, "worktree", "prune"); } catch { }
             }
@@ -735,10 +919,13 @@ public class RepoManager
         }
         else if (Directory.Exists(wt.Path))
         {
-            // No repo found — only delete if path is within our managed worktrees directory
-            // to prevent accidental deletion of arbitrary directories from corrupted state.
+            // No repo found — only delete if path is within a managed location to prevent
+            // accidental deletion of arbitrary directories from corrupted state.
+            // Managed locations: ~/.polypilot/worktrees/ OR {anyRepo}/.polypilot/worktrees/
             var fullPath = Path.GetFullPath(wt.Path);
-            if (fullPath.StartsWith(Path.GetFullPath(WorktreesDir), StringComparison.OrdinalIgnoreCase))
+            var isCentralized = fullPath.StartsWith(Path.GetFullPath(WorktreesDir), StringComparison.OrdinalIgnoreCase);
+            var isNested = fullPath.Contains(Path.DirectorySeparatorChar + ".polypilot" + Path.DirectorySeparatorChar + "worktrees" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+            if (isCentralized || isNested)
                 try { Directory.Delete(wt.Path, recursive: true); } catch { }
         }
 

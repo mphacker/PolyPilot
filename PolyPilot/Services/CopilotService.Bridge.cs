@@ -577,6 +577,56 @@ public partial class CopilotService
         return (result.RepoId, result.RepoName);
     }
 
+    /// <summary>
+    /// Add an already-cloned local folder as a managed repository. The folder's 'origin'
+    /// remote URL is used to create a bare clone in the PolyPilot repos directory, giving
+    /// the repo all the same features as if it were cloned through the app.
+    /// Desktop (local) mode only — not supported when connected to a remote server.
+    /// </summary>
+    /// <summary>
+    /// Result of adding a local folder as a repository.
+    /// </summary>
+    public record AddLocalFolderResult(
+        string RepoId,
+        string RepoName,
+        /// <summary>
+        /// When non-null, the folder was registered as an external worktree under an existing
+        /// repo group rather than creating a new 📁 group. Points to the existing group.
+        /// </summary>
+        string? ExistingGroupId,
+        string? ExistingGroupName);
+
+    public async Task<AddLocalFolderResult> AddRepoFromLocalFolderAsync(
+        string localPath,
+        Action<string>? onProgress = null,
+        CancellationToken ct = default)
+    {
+        if (IsRemoteMode)
+            throw new InvalidOperationException(
+                "Adding an existing folder is only supported in local mode. " +
+                "In remote mode the server cannot access local paths on this device.");
+
+        // Expand ~ and normalize path before any validation
+        if (localPath.StartsWith("~", StringComparison.Ordinal))
+            localPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                localPath.TrimStart('~').TrimStart('/', '\\'));
+        localPath = Path.GetFullPath(localPath);
+
+        if (!Directory.Exists(localPath))
+            throw new InvalidOperationException($"Folder not found: '{localPath}'");
+
+        // Register/update the bare clone and external worktree for this local path
+        var repo = await _repoManager.AddRepositoryFromLocalAsync(localPath, onProgress, ct);
+
+        // Ensure a dedicated 📁 local folder group exists for this path.
+        // Use PromoteOrCreateLocalFolderGroup so that if there's an existing URL-based group
+        // for this repo (created by an older code version that lacked LocalPath support),
+        // we update that group in-place rather than creating a redundant duplicate.
+        PromoteOrCreateLocalFolderGroup(localPath, repo.Id);
+        return new AddLocalFolderResult(repo.Id, repo.Name, null, null);
+    }
+
     public async Task RemoveRepoRemoteAsync(string repoId, string groupId, bool deleteFromDisk, CancellationToken ct = default)
     {
         if (!IsRemoteMode)
