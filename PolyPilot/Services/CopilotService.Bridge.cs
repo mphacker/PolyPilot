@@ -14,6 +14,12 @@ public partial class CopilotService
     private const int TurnEndHistoryLimit = 200;
 
     /// <summary>
+    /// When local history has fewer messages than this, allow SyncRemoteSessions to load
+    /// history even while the streaming guard is active (initial load phase).
+    /// </summary>
+    private const int InitialHistoryLoadThreshold = 10;
+
+    /// <summary>
     /// Convert an HTTP(S) URL to its WebSocket equivalent. Returns null for null/empty input.
     /// </summary>
     private static string? ToWebSocketUrl(string? url)
@@ -86,8 +92,8 @@ public partial class CopilotService
         };
         _bridgeClient.OnContentReceived += (s, c) =>
         {
-            // Track that this session is actively streaming
-            _remoteStreamingSessions[s] = 0;
+            // Ensure streaming guard is present (don't overwrite generation counter)
+            _remoteStreamingSessions.TryAdd(s, 0);
 
             // Update local session history from remote events
             var session = GetRemoteSession(s);
@@ -103,12 +109,14 @@ public partial class CopilotService
         };
         _bridgeClient.OnToolStarted += (s, tool, id, input) =>
         {
+            _remoteStreamingSessions.TryAdd(s, 0); // ensure guard present, don't reset generation
             var session = GetRemoteSession(s);
             session?.History.Add(ChatMessage.ToolCallMessage(tool, id, input));
             InvokeOnUI(() => OnToolStarted?.Invoke(s, tool, id, input));
         };
         _bridgeClient.OnToolCompleted += (s, id, result, success) =>
         {
+            _remoteStreamingSessions.TryAdd(s, 0); // ensure guard present, don't reset generation
             var session = GetRemoteSession(s);
             var toolMsg = session?.History.LastOrDefault(m => m.ToolCallId == id);
             if (toolMsg != null)
@@ -181,9 +189,20 @@ public partial class CopilotService
         _bridgeClient.OnUsageInfoChanged += (s, u) => InvokeOnUI(() => OnUsageInfoChanged?.Invoke(s, u));
         _bridgeClient.OnTurnStart += (s) =>
         {
-            var session = GetRemoteSession(s);
-            if (session != null) { session.IsProcessing = true; }
-            InvokeOnUI(() => OnTurnStart?.Invoke(s));
+            // Increment generation counter — each sub-turn gets a new generation so
+            // a delayed guard removal from a previous sub-turn won't kill this one.
+            _remoteStreamingSessions.AddOrUpdate(s, 1, (_, prev) => prev + 1);
+            // Set IsProcessing on the UI thread to avoid race with TurnEnd:
+            // When TurnEnd and TurnStart arrive back-to-back, both InvokeOnUI callbacks
+            // are queued. TurnEnd fires first (sets false), then TurnStart fires (sets true).
+            // Previously, TurnStart set true on the background thread which was overwritten
+            // by TurnEnd's UI callback.
+            InvokeOnUI(() =>
+            {
+                var session = GetRemoteSession(s);
+                if (session != null) { session.IsProcessing = true; }
+                OnTurnStart?.Invoke(s);
+            });
         };
         _bridgeClient.OnTurnEnd += (s) =>
         {
@@ -208,20 +227,31 @@ public partial class CopilotService
                 OnTurnEnd?.Invoke(s);
             });
             // Request fresh history (capped to avoid massive payloads for long conversations),
-            // then clear the streaming guard so SyncRemoteSessions
+            // then clear the streaming guard and force a sync so SyncRemoteSessions
             // uses the up-to-date history instead of a stale cache.
+            // Capture generation so the delayed removal doesn't kill a newer sub-turn's guard.
+            _remoteStreamingSessions.TryGetValue(s, out var turnEndGen);
             _ = Task.Run(async () =>
             {
                 try
                 {
                     await _bridgeClient.RequestHistoryAsync(s, limit: TurnEndHistoryLimit);
-                    // Small delay to let the history response arrive before unguarding
-                    await Task.Delay(500);
+                    // Wait for the history response to arrive via the WebSocket receive loop.
+                    // 2s is generous enough for LAN/tunnel round-trips.
+                    await Task.Delay(2000);
                 }
                 catch { }
                 finally
                 {
-                    _remoteStreamingSessions.TryRemove(s, out _);
+                    // Only remove guard if no new sub-turn has started since this TurnEnd.
+                    // Atomic removal: only succeeds if both key and value match, preventing
+                    // a TOCTOU race where TurnStart increments the generation between
+                    // TryGetValue and TryRemove.
+                    _remoteStreamingSessions.TryRemove(new KeyValuePair<string, int>(s, turnEndGen));
+                    // Force sync now that the guard is down — ensures fresh history
+                    // from the server replaces incrementally-built content.
+                    SyncRemoteSessions();
+                    NotifyStateChangedCoalesced();
                 }
             });
         };
@@ -448,8 +478,8 @@ public partial class CopilotService
                     state.Info.ProcessingStartedAt = rs.ProcessingStartedAt;
                     state.Info.ToolCallCount = rs.ToolCallCount;
                     state.Info.ProcessingPhase = rs.ProcessingPhase;
+                    state.Info.MessageCount = rs.MessageCount;
                 }
-                state.Info.MessageCount = rs.MessageCount;
                 if (!string.IsNullOrEmpty(rs.Model))
                     state.Info.Model = rs.Model;
             }
@@ -487,14 +517,19 @@ public partial class CopilotService
         // Don't overwrite if local history has messages not yet reflected by server
         // Skip sessions that are actively streaming — content_delta handlers update history
         // incrementally; replacing it with the (stale) SessionHistories cache would cause duplicates.
+        // Exception: allow sync when local history is very small (initial load) — the guard is up
+        // because TurnStart fired but the full history hasn't been loaded yet.
         var sessionsNeedingHistory = new List<string>();
         foreach (var (name, messages) in _bridgeClient.SessionHistories)
         {
             if (_sessions.TryGetValue(name, out var s))
             {
                 // Skip history sync for sessions currently receiving streaming content —
-                // the incremental content_delta/tool events are more up-to-date than the cached history
-                if (_remoteStreamingSessions.ContainsKey(name))
+                // the incremental content_delta/tool events are more up-to-date than the cached history.
+                // But allow initial full-history sync through even with the guard up:
+                // when local history is tiny (< 10), we're still in the initial load phase and
+                // the guard is only active because TurnStart fired before history arrived.
+                if (_remoteStreamingSessions.ContainsKey(name) && s.Info.History.Count >= InitialHistoryLoadThreshold)
                     continue;
 
                 if (messages.Count >= s.Info.History.Count)
