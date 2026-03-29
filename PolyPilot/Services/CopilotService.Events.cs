@@ -643,6 +643,7 @@ public partial class CopilotService
                 // Do NOT treat this as terminal — flush text and wait for the real idle.
                 if (HasActiveBackgroundTasks(idle))
                 {
+                    state.HasDeferredIdle = true; // Track for watchdog freshness window
                     Debug($"[IDLE-DEFER] '{sessionName}' session.idle received with active background tasks — " +
                           $"deferring completion (IsProcessing={state.Info.IsProcessing}, " +
                           $"response={state.CurrentResponse.Length}+{state.FlushedResponse.Length} chars)");
@@ -781,6 +782,7 @@ public partial class CopilotService
                 CancelToolHealthCheck(state);
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
+                state.HasDeferredIdle = false;
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
                 Interlocked.Exchange(ref state.EventCountThisTurn, 0);
@@ -1027,6 +1029,7 @@ public partial class CopilotService
         CancelToolHealthCheck(state);
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
         state.HasUsedToolsThisTurn = false;
+        state.HasDeferredIdle = false;
         state.IsReconnectedSend = false; // Clear reconnect flag on turn completion (defense-in-depth)
         state.FallbackCanceledByTurnStart = false;
         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
@@ -1775,6 +1778,7 @@ public partial class CopilotService
             // Full cleanup mirroring CompleteResponse — missing fields here caused stuck sessions
             Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
             state.HasUsedToolsThisTurn = false;
+            state.HasDeferredIdle = false;
             state.FallbackCanceledByTurnStart = false;
             Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
             Interlocked.Exchange(ref state.WatchdogCaseAResets, 0);
@@ -2173,7 +2177,7 @@ public partial class CopilotService
                                 // - "after turn start" alone stays true forever once any event is written
                                 // - "recent" alone could match stale files from a previous turn
                                 var caseBEventsActive = false;
-                                var freshnessSeconds = isMultiAgentSession
+                                var freshnessSeconds = (isMultiAgentSession || state.HasDeferredIdle)
                                     ? WatchdogMultiAgentCaseBFreshnessSeconds
                                     : WatchdogCaseBFreshnessSeconds;
                                 try
@@ -2348,6 +2352,7 @@ public partial class CopilotService
                         CancelToolHealthCheck(state);
                         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                         state.HasUsedToolsThisTurn = false;
+                        state.HasDeferredIdle = false;
                         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                         Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
                         Interlocked.Exchange(ref state.EventCountThisTurn, 0);
@@ -2442,6 +2447,7 @@ public partial class CopilotService
                     Interlocked.Exchange(ref state.SendingFlag, 0);
                     Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                     state.HasUsedToolsThisTurn = false;
+                    state.HasDeferredIdle = false;
                     Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                     Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
                     Interlocked.Exchange(ref state.EventCountThisTurn, 0);
@@ -2497,6 +2503,7 @@ public partial class CopilotService
             state.Info.IsProcessing = false;
             state.Info.IsResumed = false;
             state.HasUsedToolsThisTurn = false;
+            state.HasDeferredIdle = false;
             Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
             Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
             Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
@@ -2595,6 +2602,7 @@ public partial class CopilotService
             Interlocked.Exchange(ref state.SendingFlag, 0);
             // Clear stale tool flag so watchdog uses normal timeout if resend is skipped
             newState.HasUsedToolsThisTurn = false;
+            newState.HasDeferredIdle = false;
 
             // Replace in sessions dictionary BEFORE registering event handler
             // so HandleSessionEvent's isCurrentState check passes for the new state.
@@ -2632,6 +2640,7 @@ public partial class CopilotService
                 state.Info.IsProcessing = false;
                 state.Info.IsResumed = false;
                 state.HasUsedToolsThisTurn = false;
+                state.HasDeferredIdle = false;
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);

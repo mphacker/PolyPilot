@@ -407,7 +407,12 @@ public partial class CopilotService
             // waiting for tool results that will never arrive. It silently queues/ignores
             // new SendAsync calls until the pending tools are resolved. An explicit abort
             // clears this state and allows new messages to flow.
-            if (wasResumed && HasInterruptedToolExecution(sessionId))
+            //
+            // IMPORTANT: Only abort if the CLI has actually stopped working. In persistent
+            // mode, the headless server keeps running tools even while PolyPilot is down.
+            // If IsSessionStillProcessing() says the CLI is active, the tool results WILL
+            // arrive — aborting would kill legitimate in-progress work.
+            if (wasResumed && HasInterruptedToolExecution(sessionId) && !IsSessionStillProcessing(sessionId))
             {
                 Debug($"[RESUME-ABORT] '{sessionName}' has interrupted tool execution — sending abort to clear pending state");
                 try
@@ -419,6 +424,23 @@ public partial class CopilotService
                 {
                     Debug($"[RESUME-ABORT] '{sessionName}' abort failed (non-fatal): {abortEx.Message}");
                 }
+            }
+            else if (wasResumed && HasInterruptedToolExecution(sessionId))
+            {
+                Debug($"[RESUME-SKIP-ABORT] '{sessionName}' has unmatched tool starts but CLI is still active — NOT aborting");
+                // The CLI is still running tools — mark the session as processing so the UI
+                // shows it as busy. Set watchdog flags so it gets the longer tool timeout.
+                // INV-2: marshal to UI thread — EnsureSessionConnectedAsync runs from Task.Run.
+                InvokeOnUI(() =>
+                {
+                    state.Info.IsProcessing = true;
+                    state.Info.IsResumed = true;
+                    state.HasUsedToolsThisTurn = true;
+                    state.Info.ProcessingPhase = 3; // Working
+                    state.Info.ProcessingStartedAt = DateTime.UtcNow;
+                    StartProcessingWatchdog(state, sessionName);
+                    NotifyStateChanged();
+                });
             }
 
             Debug($"Lazy-resume complete: '{sessionName}'");
@@ -601,10 +623,16 @@ public partial class CopilotService
                             _sessions[entry.DisplayName] = lazyState;
                             _activeSessionName ??= entry.DisplayName;
                             RestoreUsageStats(entry);
-                            if (!string.IsNullOrWhiteSpace(entry.LastPrompt))
+                            // Eagerly resume sessions that are still actively processing on the
+                            // headless server. Check events.jsonl (authoritative) first, then fall
+                            // back to LastPrompt (saved when IsProcessing=true at debounce time).
+                            // Without this, actively-running sessions appear idle after app restart
+                            // because they're only loaded as lazy placeholders with no SDK connection.
+                            var isStillActive = IsSessionStillProcessing(entry.SessionId);
+                            if (isStillActive || !string.IsNullOrWhiteSpace(entry.LastPrompt))
                             {
                                 eagerResumeCandidates.Add((entry.DisplayName, lazyState));
-                                Debug($"Queued eager resume for interrupted session: {entry.DisplayName}");
+                                Debug($"Queued eager resume for interrupted session: {entry.DisplayName} (active={isStillActive}, hasLastPrompt={!string.IsNullOrWhiteSpace(entry.LastPrompt)})");
                             }
                             Debug($"Loaded session placeholder: {entry.DisplayName} ({lazyHistory.Count} messages)");
                         }

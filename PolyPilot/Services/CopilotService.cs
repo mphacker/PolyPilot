@@ -534,6 +534,11 @@ public partial class CopilotService : IAsyncDisposable
         /// When this reaches WatchdogCaseBMaxStaleChecks, deferral is stopped even if the file
         /// modification time is within the freshness window (dead connection detected).</summary>
         public int WatchdogCaseBStaleCount;
+        /// <summary>True when an IDLE-DEFER has been observed for this session — the CLI reported
+        /// active background tasks (subagents/shells). The watchdog uses this to apply the longer
+        /// multi-agent freshness window even for non-multi-agent-group sessions, because the CLI
+        /// has confirmed it's running background work that won't produce events.jsonl writes.</summary>
+        public volatile bool HasDeferredIdle;
         /// <summary>True if the TurnEnd→Idle fallback was canceled by an AssistantTurnStartEvent.
         /// Used for diagnostic logging: when the next TurnEnd re-arms the fallback, the log shows
         /// the self-healing loop in action (TurnEnd → TurnStart cancel → TurnEnd re-arm).</summary>
@@ -1087,6 +1092,7 @@ public partial class CopilotService : IAsyncDisposable
         _sessions.Clear();
         _closedSessionIds.Clear();
         _closedSessionNames.Clear();
+        _recentTurnEndSessions.Clear();
         lock (_imageQueueLock)
         {
             _queuedImagePaths.Clear();
@@ -1300,6 +1306,7 @@ public partial class CopilotService : IAsyncDisposable
             _sessions.Clear();
             _closedSessionIds.Clear();
             _closedSessionNames.Clear();
+            _recentTurnEndSessions.Clear();
 
             // 2. Dispose old client
             if (_client != null)
@@ -3049,6 +3056,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.Info.ClearPermissionDenials();
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0); // Reset stale tool count from previous turn
         state.HasUsedToolsThisTurn = false; // Reset stale tool flag from previous turn
+        state.HasDeferredIdle = false; // Reset deferred idle flag from previous turn
         state.IsReconnectedSend = false; // Clear reconnect flag — new turn starts fresh (see watchdog reconnect timeout)
         state.PrematureIdleSignal.Reset(); // Clear premature idle detection from previous turn
         state.FallbackCanceledByTurnStart = false;
@@ -3337,6 +3345,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                                     };
                                                     // Mirror primary reconnect: reset tool tracking for new connection
                                                     siblingState.HasUsedToolsThisTurn = false;
+                                                    siblingState.HasDeferredIdle = false;
                                                     Interlocked.Exchange(ref siblingState.ActiveToolCallCount, 0);
                                                     Interlocked.Exchange(ref siblingState.SuccessfulToolCountThisTurn, 0);
                                                     Interlocked.Exchange(ref siblingState.ToolHealthStaleChecks, 0);
@@ -3528,6 +3537,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // inflates the watchdog timeout from 120s to 600s, making stuck
                     // sessions wait 5x longer than necessary to recover.
                     newState.HasUsedToolsThisTurn = false;
+                    newState.HasDeferredIdle = false;
                     Interlocked.Exchange(ref newState.ActiveToolCallCount, 0);
                     Interlocked.Exchange(ref newState.SuccessfulToolCountThisTurn, 0);
                     newState.IsMultiAgentSession = state.IsMultiAgentSession;
@@ -3563,6 +3573,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // Reset HasUsedToolsThisTurn so the retried turn starts with the default
                     // 120s watchdog tier instead of the inflated 600s from stale tool state.
                     state.HasUsedToolsThisTurn = false;
+                    state.HasDeferredIdle = false;
 
                     // Schedule persistence of the new session ID so it survives app restart.
                     // Without this, the debounced save captures the pre-reconnect snapshot
@@ -3624,6 +3635,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     Debug($"[ERROR] '{sessionName}' reconnect+retry failed, clearing IsProcessing");
                     Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                     state.HasUsedToolsThisTurn = false;
+                    state.HasDeferredIdle = false;
                     Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                     state.Info.IsResumed = false;
                     state.Info.IsProcessing = false;
@@ -3646,6 +3658,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Debug($"[ERROR] '{sessionName}' SendAsync failed, clearing IsProcessing (error={ex.Message})");
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
+                state.HasDeferredIdle = false;
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 state.Info.IsResumed = false;
                 state.Info.IsProcessing = false;
@@ -3796,6 +3809,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.Info.ProcessingPhase = 0;
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
         state.HasUsedToolsThisTurn = false;
+        state.HasDeferredIdle = false;
         state.IsReconnectedSend = false; // INV-1: clear all per-turn flags on abort
         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
         // Release send lock — allows a subsequent SteerSessionAsync to acquire it immediately
@@ -3903,6 +3917,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Debug($"[STEER-ERROR] '{sessionName}' soft steer SendAsync failed, clearing IsProcessing (error={ex.Message})");
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
+                state.HasDeferredIdle = false;
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 state.Info.IsResumed = false;
                 Interlocked.Exchange(ref state.SendingFlag, 0);
@@ -4188,6 +4203,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     state.Info.IsProcessing = false;
                     state.Info.IsResumed = false;
                     state.HasUsedToolsThisTurn = false;
+                    state.HasDeferredIdle = false;
                     Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                     Interlocked.Exchange(ref state.SendingFlag, 0);
                     state.Info.ProcessingStartedAt = null;
