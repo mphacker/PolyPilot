@@ -403,44 +403,67 @@ public partial class CopilotService
             state.Session = copilotSession;
             state.IsMultiAgentSession = IsSessionInMultiAgentGroup(sessionName);
 
-            // If we resumed a session that crashed mid-tool-execution, the SDK is stuck
-            // waiting for tool results that will never arrive. It silently queues/ignores
-            // new SendAsync calls until the pending tools are resolved. An explicit abort
-            // clears this state and allows new messages to flow.
-            //
-            // IMPORTANT: Only abort if the CLI has actually stopped working. In persistent
-            // mode, the headless server keeps running tools even while PolyPilot is down.
-            // If IsSessionStillProcessing() says the CLI is active, the tool results WILL
-            // arrive — aborting would kill legitimate in-progress work.
-            if (wasResumed && HasInterruptedToolExecution(sessionId) && !IsSessionStillProcessing(sessionId))
+            // After resume, if events.jsonl shows unmatched tool_execution_start events,
+            // the CLI was mid-tool when PolyPilot last connected. In persistent mode the
+            // headless server keeps running tools even while PolyPilot is down — the results
+            // WILL arrive once we reconnect. Never abort on resume; instead mark as processing
+            // and let the watchdog handle truly dead sessions via timeout (30-600s depending
+            // on state). This avoids killing legitimate long-running tool executions that can
+            // run 15-30+ minutes without writing to events.jsonl.
+            if (wasResumed && HasInterruptedToolExecution(sessionId))
             {
-                Debug($"[RESUME-ABORT] '{sessionName}' has interrupted tool execution — sending abort to clear pending state");
-                try
-                {
-                    await copilotSession.AbortAsync(cancellationToken);
-                    Debug($"[RESUME-ABORT] '{sessionName}' abort sent successfully");
-                }
-                catch (Exception abortEx)
-                {
-                    Debug($"[RESUME-ABORT] '{sessionName}' abort failed (non-fatal): {abortEx.Message}");
-                }
-            }
-            else if (wasResumed && HasInterruptedToolExecution(sessionId))
-            {
-                Debug($"[RESUME-SKIP-ABORT] '{sessionName}' has unmatched tool starts but CLI is still active — NOT aborting");
-                // The CLI is still running tools — mark the session as processing so the UI
-                // shows it as busy. Set watchdog flags so it gets the longer tool timeout.
+                // Use CLI liveness to choose watchdog tier — never abort in either case.
                 // INV-2: marshal to UI thread — EnsureSessionConnectedAsync runs from Task.Run.
-                InvokeOnUI(() =>
+                // INV-3/INV-12: capture generation to prevent stale callback from re-arming
+                // IsProcessing after a user-initiated turn has already completed.
+                bool cliStillActive = IsSessionStillProcessing(sessionId);
+                var gen = Interlocked.Read(ref state.ProcessingGeneration);
+
+                if (cliStillActive)
                 {
-                    state.Info.IsProcessing = true;
-                    state.Info.IsResumed = true;
-                    state.HasUsedToolsThisTurn = true;
-                    state.Info.ProcessingPhase = 3; // Working
-                    state.Info.ProcessingStartedAt = DateTime.UtcNow;
-                    StartProcessingWatchdog(state, sessionName);
-                    NotifyStateChanged();
-                });
+                    Debug($"[RESUME-ACTIVE] '{sessionName}' has unmatched tool starts and CLI is alive — 600s tool timeout");
+                    InvokeOnUI(() =>
+                    {
+                        if (Interlocked.Read(ref state.ProcessingGeneration) != gen) return;
+                        state.Info.IsProcessing = true;
+                        state.Info.IsResumed = true;
+                        state.HasUsedToolsThisTurn = true;
+                        state.Info.ProcessingPhase = 3; // Working
+                        state.Info.ProcessingStartedAt = DateTime.UtcNow;
+                        StartProcessingWatchdog(state, sessionName);
+                        NotifyStateChanged();
+                    });
+                }
+                else
+                {
+                    Debug($"[RESUME-QUIESCE] '{sessionName}' has unmatched tool starts but CLI is stale — clearing SDK tool state + 30s quiescence timeout");
+                    // CLI is dead — clear SDK-internal pending tool expectations so future
+                    // SendAsync calls aren't silently dropped. This is safe because the CLI
+                    // won't be delivering those tool results anyway.
+                    try
+                    {
+                        await copilotSession.AbortAsync(cancellationToken);
+                        Debug($"[RESUME-QUIESCE] '{sessionName}' abort sent to clear pending tool state");
+                    }
+                    catch (Exception abortEx)
+                    {
+                        Debug($"[RESUME-QUIESCE] '{sessionName}' abort failed (non-fatal): {abortEx.Message}");
+                    }
+                    InvokeOnUI(() =>
+                    {
+                        if (Interlocked.Read(ref state.ProcessingGeneration) != gen) return;
+                        state.Info.IsProcessing = true;
+                        state.Info.IsResumed = true;
+                        // Reset in case AbortAsync triggered an SDK event on a background thread
+                        // that set this to true — would defeat the 30s quiescence check.
+                        Volatile.Write(ref state.HasReceivedEventsSinceResume, false);
+                        // Do NOT set HasUsedToolsThisTurn — lets watchdog use 30s resume quiescence
+                        state.Info.ProcessingPhase = 3; // Working
+                        state.Info.ProcessingStartedAt = DateTime.UtcNow;
+                        StartProcessingWatchdog(state, sessionName);
+                        NotifyStateChanged();
+                    });
+                }
             }
 
             Debug($"Lazy-resume complete: '{sessionName}'");
